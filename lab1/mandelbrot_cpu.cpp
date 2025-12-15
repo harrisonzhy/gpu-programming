@@ -42,6 +42,64 @@ void mandelbrot_cpu_scalar(uint32_t img_size, uint32_t max_iters, uint32_t *out)
 
 void mandelbrot_cpu_vector(uint32_t img_size, uint32_t max_iters, uint32_t *out) {
     // TODO: Implement this function.
+
+    const auto two_five_f = _mm512_set1_ps(2.5);
+    const auto two_f = _mm512_set1_ps(2.0);
+    const auto one_two_five_f = _mm512_set1_ps(1.25);
+    const auto four_f = _mm512_set1_ps(4.0);
+    const auto zero_f = _mm512_set1_ps(0.0);
+
+    const auto one_i = _mm512_set1_epi32(1);
+    const auto two_i = _mm512_set1_epi32(2);
+
+    const auto norm = _mm512_set1_ps(1.0 / img_size);
+    const auto max_iters_vec = _mm512_set1_epi32(max_iters);
+
+    const auto offset = _mm512_set_ps(15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
+    
+    for (uint64_t i = 0; i < img_size; ++i) {
+        for (uint64_t j = 0; j < img_size; j += 16) {
+
+            auto ii = _mm512_set1_ps(i);
+            auto jj = _mm512_add_ps(_mm512_set1_ps(j), offset);
+            
+            auto cx = _mm512_sub_ps(_mm512_mul_ps(_mm512_mul_ps(jj, norm), two_five_f), two_f);
+            auto cy = _mm512_sub_ps(_mm512_mul_ps(_mm512_mul_ps(ii, norm), two_five_f), one_two_five_f);
+        
+            auto x2 = _mm512_set1_ps(0.0);
+            auto y2 = _mm512_set1_ps(0.0);
+            auto w = _mm512_set1_ps(0.0);
+            auto iters = _mm512_set1_epi32(0);
+
+            while (true) {
+                auto sum_x2y2 = _mm512_add_ps(x2, y2);
+                auto sum_leq_four_mask = _mm512_cmp_ps_mask(sum_x2y2, four_f, _MM_CMPINT_LE);
+                auto iter_mask = _mm512_cmp_epi32_mask(iters, max_iters_vec, _MM_CMPINT_LT);
+
+                auto all_mask = sum_leq_four_mask & iter_mask;
+                // if all_mask is all zero, then we are done
+                if (all_mask == 0) {
+                    break;
+                }
+                
+                // otherwise continue
+                auto x = _mm512_mask_add_ps(zero_f, all_mask, 
+                    _mm512_mask_sub_ps(zero_f, all_mask, x2, y2), 
+                    cx);
+                auto y = _mm512_mask_add_ps(zero_f, all_mask, 
+                    _mm512_mask_sub_ps(zero_f, all_mask, _mm512_mask_sub_ps(zero_f, all_mask, w, x2), y2), 
+                    cy);
+                x2 = _mm512_mask_mul_ps(x2, all_mask, x, x);
+                y2 = _mm512_mask_mul_ps(y2, all_mask, y, y);
+                auto z = _mm512_mask_add_ps(zero_f, all_mask, x, y);
+                w = _mm512_mask_mul_ps(w, all_mask, z, z);
+
+                iters = _mm512_mask_add_epi32(iters, all_mask, iters, one_i);
+            }
+
+            _mm512_storeu_si512(&out[i * img_size + j], iters);
+        }
+    }
 }
 
 /// <--- /your code here --->
