@@ -239,11 +239,120 @@ void mandelbrot_cpu_vector_ilp(uint32_t img_size, uint32_t max_iters, uint32_t *
 ////////////////////////////////////////////////////////////////////////////////
 // Vector + Multi-core
 
+typedef struct mandelbrot_args_ {
+    uint32_t thread_idx;
+    uint32_t img_size;
+    uint32_t max_iters;
+    uint32_t *out;
+} mandelbrot_args_t;
+
+void* mandelbrot_cpu_vector_multicore_(
+    void* args_) {
+
+    auto args = (mandelbrot_args_t*)args_;
+
+    // TODO: Implement this function.
+    uint32_t thread_idx = args->thread_idx;
+    uint32_t img_size = args->img_size;
+    uint32_t max_iters = args->max_iters;
+    uint32_t* out = args->out;
+
+    const auto two_five_f = _mm512_set1_ps(window_zoom);
+    const auto two_f = _mm512_set1_ps(window_x);
+    const auto one_two_five_f = _mm512_set1_ps(window_y);
+    const auto four_f = _mm512_set1_ps(4.0);
+    const auto zero_f = _mm512_set1_ps(0.0);
+
+    const auto one_i = _mm512_set1_epi32(1);
+    const auto two_i = _mm512_set1_epi32(2);
+
+    const auto norm = _mm512_set1_ps(1.0 / img_size);
+    const auto max_iters_vec = _mm512_set1_epi32(max_iters);
+
+    const auto offset = _mm512_set_ps(15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
+    
+    const auto chunk_size = img_size / 8;
+    const auto chunk_start = thread_idx * chunk_size;
+
+    for (uint64_t i = chunk_start; i < chunk_start + chunk_size; ++i) {
+        for (uint64_t j = 0; j < img_size; j += 16) {
+
+            auto ii = _mm512_set1_ps(i);
+            auto jj = _mm512_add_ps(_mm512_set1_ps(j), offset);
+            
+            auto cx = _mm512_add_ps(_mm512_mul_ps(_mm512_mul_ps(jj, norm), two_five_f), two_f);
+            auto cy = _mm512_add_ps(_mm512_mul_ps(_mm512_mul_ps(ii, norm), two_five_f), one_two_five_f);
+        
+            auto x2 = _mm512_set1_ps(0.0);
+            auto y2 = _mm512_set1_ps(0.0);
+            auto w = _mm512_set1_ps(0.0);
+            auto iters = _mm512_set1_epi32(0);
+
+            while (true) {
+                auto sum_x2y2 = _mm512_add_ps(x2, y2);
+                auto sum_leq_four_mask = _mm512_cmp_ps_mask(sum_x2y2, four_f, _MM_CMPINT_LE);
+                auto iter_mask = _mm512_cmp_epi32_mask(iters, max_iters_vec, _MM_CMPINT_LT);
+
+                auto all_mask = sum_leq_four_mask & iter_mask;
+                // if all_mask is all zero, then we are done
+                if (all_mask == 0) {
+                    break;
+                }
+                
+                // otherwise continue
+                auto x = _mm512_mask_add_ps(zero_f, all_mask, 
+                    _mm512_mask_sub_ps(zero_f, all_mask, x2, y2), 
+                    cx);
+                auto y = _mm512_mask_add_ps(zero_f, all_mask, 
+                    _mm512_mask_sub_ps(zero_f, all_mask, w, sum_x2y2),
+                    cy);
+
+                x2 = _mm512_mask_mul_ps(x2, all_mask, x, x);
+                y2 = _mm512_mask_mul_ps(y2, all_mask, y, y);
+                auto z = _mm512_mask_add_ps(zero_f, all_mask, x, y);
+                w = _mm512_mask_mul_ps(w, all_mask, z, z);
+
+                iters = _mm512_mask_add_epi32(iters, all_mask, iters, one_i);
+            }
+
+            _mm512_storeu_si512(&out[i * img_size + j], iters);
+        }
+    }
+
+    return nullptr;
+}
+
 void mandelbrot_cpu_vector_multicore(
     uint32_t img_size,
     uint32_t max_iters,
     uint32_t *out) {
     // TODO: Implement this function.
+
+    constexpr int N_CORES = 8;
+
+    pthread_t thread_id[N_CORES];
+    mandelbrot_args_t mandelbrot_args[N_CORES];
+    int return_code[N_CORES];
+
+    for (uint32_t i = 0; i < N_CORES; ++i) {
+        mandelbrot_args[i] = {
+            i, 
+            img_size,
+            max_iters,
+            out
+        };
+        return_code[i] = pthread_create(&thread_id[i], nullptr, mandelbrot_cpu_vector_multicore_, (void*)&mandelbrot_args[i]);
+        if (return_code[i] != 0) {
+            exit(1);
+        }
+    }
+
+    for (int i = 0; i < N_CORES; ++i) {
+        return_code[i] = pthread_join(thread_id[i], nullptr);
+        if (return_code[i] != 0) {
+            exit(1);
+        }
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
