@@ -243,6 +243,7 @@ typedef struct mandelbrot_args_ {
     uint32_t thread_idx;
     uint32_t img_size;
     uint32_t max_iters;
+    uint32_t n_threads;
     uint32_t *out;
 } mandelbrot_args_t;
 
@@ -271,7 +272,7 @@ void* mandelbrot_cpu_vector_multicore_(
 
     const auto offset = _mm512_set_ps(15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
     
-    const auto chunk_size = img_size / 8;
+    const auto chunk_size = img_size / n_threads;
     const auto chunk_start = thread_idx * chunk_size;
 
     for (uint64_t i = chunk_start; i < chunk_start + chunk_size; ++i) {
@@ -328,17 +329,18 @@ void mandelbrot_cpu_vector_multicore(
     uint32_t *out) {
     // TODO: Implement this function.
 
-    constexpr int N_CORES = 8;
+    constexpr int n_cores = 8;
 
-    pthread_t thread_id[N_CORES];
-    mandelbrot_args_t mandelbrot_args[N_CORES];
-    int return_code[N_CORES];
+    pthread_t thread_id[n_cores];
+    mandelbrot_args_t mandelbrot_args[n_cores];
+    int return_code[n_cores];
 
-    for (uint32_t i = 0; i < N_CORES; ++i) {
+    for (uint32_t i = 0; i < n_cores; ++i) {
         mandelbrot_args[i] = {
             i, 
             img_size,
             max_iters,
+            n_cores,
             out
         };
         return_code[i] = pthread_create(&thread_id[i], nullptr, mandelbrot_cpu_vector_multicore_, (void*)&mandelbrot_args[i]);
@@ -347,7 +349,7 @@ void mandelbrot_cpu_vector_multicore(
         }
     }
 
-    for (int i = 0; i < N_CORES; ++i) {
+    for (int i = 0; i < n_cores; ++i) {
         return_code[i] = pthread_join(thread_id[i], nullptr);
         if (return_code[i] != 0) {
             exit(1);
@@ -363,6 +365,33 @@ void mandelbrot_cpu_vector_multicore_multithread(
     uint32_t max_iters,
     uint32_t *out) {
     // TODO: Implement this function.
+
+    constexpr uint32_t n_threads = 16;
+
+    pthread_t thread_id[n_threads];
+    mandelbrot_args_t mandelbrot_args[n_threads];
+    int return_code[n_threads];
+
+    for (uint32_t i = 0; i < n_threads; ++i) {
+        mandelbrot_args[i] = {
+            i, 
+            img_size,
+            max_iters,
+            n_threads,
+            out
+        };
+        return_code[i] = pthread_create(&thread_id[i], nullptr, mandelbrot_cpu_vector_multicore_, (void*)&mandelbrot_args[i]);
+        if (return_code[i] != 0) {
+            exit(1);
+        }
+    }
+
+    for (int i = 0; i < n_threads; ++i) {
+        return_code[i] = pthread_join(thread_id[i], nullptr);
+        if (return_code[i] != 0) {
+            exit(1);
+        }
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
