@@ -104,41 +104,18 @@ __global__ void mandelbrot_gpu_vector_multicore(
     uint32_t *out /* pointer to GPU memory */
 ) {
     /* your (GPU) code here... */
-    const auto lane = threadIdx.x;
     const auto n_threads_per_warp = 32;
+    const auto lane = threadIdx.x % n_threads_per_warp;
+    const auto warp = threadIdx.x / n_threads_per_warp;
+    const auto warps_per_block = blockDim.x / n_threads_per_warp;
     const auto block = blockIdx.x;
     const auto n_blocks = gridDim.x;
+    const auto n_warps = n_blocks * warps_per_block;
 
-    const uint32_t img_size_rounded = (img_size / n_blocks) * n_blocks;    
-
-    // each block strides n_blocks rows for the first `img_size_rounded` rows
-    for (uint64_t i = block; i < img_size_rounded; i += n_blocks) {
-        for (uint64_t j = lane; j < img_size; j += n_threads_per_warp) {
-            float cx = (float(j) / float(img_size)) * window_zoom + window_x;
-            float cy = (float(i) / float(img_size)) * window_zoom + window_y;
-            
-            // Innermost loop: start the recursion from z = 0.
-            float x2 = 0.0f;
-            float y2 = 0.0f;
-            float w = 0.0f;
-            uint32_t iters = 0;
-            while (x2 + y2 <= 4.0f && iters < max_iters) {
-                float x = x2 - y2 + cx;
-                float y = w - (x2 + y2) + cy;
-                x2 = x * x;
-                y2 = y * y;
-                float z = x + y;
-                w = z * z;
-                ++iters;
-            }
-
-            // Write result.
-            out[i * img_size + j] = iters;
-        }
-    }
-
-    // compute remaining tail rows
-    for (uint64_t i = img_size_rounded + block; i < img_size; i += n_blocks) {
+    // each block strides n_blocks * warps_per_block = n_warps rows
+    // each warp does one row
+    // each thread does 32 elements in the row
+    for (uint64_t i = block * warps_per_block + warp; i < img_size; i += n_warps) {
         for (uint64_t j = lane; j < img_size; j += n_threads_per_warp) {
             float cx = (float(j) / float(img_size)) * window_zoom + window_x;
             float cy = (float(i) / float(img_size)) * window_zoom + window_y;
@@ -171,8 +148,8 @@ void launch_mandelbrot_gpu_vector_multicore(
 ) {
     /* your (CPU) code here... */
     // 48: assign one block to each of 48 SMs
-    // 4 * 32: each warp has 32 threads, 4 warp schedulers in one SM
-    //  - We want to run one warp on each warp scheduler
+    // 4 * 32: 4 warp schedulers in one SM, and each warp has 32 threads = 4 * 32 total threads
+    //  - We want to run 1 warp on each warp scheduler
     mandelbrot_gpu_vector_multicore<<<48, 4 * 32>>>(img_size, max_iters, out);
 }
 
@@ -223,7 +200,7 @@ void launch_mandelbrot_gpu_vector_multicore_multithread_single_sm(
     uint32_t *out /* pointer to GPU memory */
 ) {
     /* your (CPU) code here... */
-    constexpr int num_warps = 32; // max of 32 per block
+    constexpr int num_warps = 4; // max of 32 per block
     constexpr int n_threads_per_warp = 32;
 
     mandelbrot_gpu_vector_multicore_multithread_single_sm<<<1 /* one block */, num_warps * n_threads_per_warp>>>(img_size, max_iters, out);
@@ -238,6 +215,7 @@ __global__ void mandelbrot_gpu_vector_multicore_multithread_full(
     uint32_t *out /* pointer to GPU memory */
 ) {
     /* your (GPU) code here... */
+    // same as `mandelbrot_gpu_vector_multicore`
 }
 
 void launch_mandelbrot_gpu_vector_multicore_multithread_full(
@@ -246,6 +224,9 @@ void launch_mandelbrot_gpu_vector_multicore_multithread_full(
     uint32_t *out /* pointer to GPU memory */
 ) {
     /* your (CPU) code here... */
+    constexpr int n_warps = 8;
+    constexpr int n_threads_per_warp = 32;
+    mandelbrot_gpu_vector_multicore<<<142 /* L40S has 142 SMs */, n_warps * n_threads_per_warp>>>(img_size, max_iters, out);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
