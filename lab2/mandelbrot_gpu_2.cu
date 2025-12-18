@@ -164,11 +164,9 @@ __global__ void mandelbrot_gpu_vector_multicore_multithread_single_sm(
     /* your (GPU) code here... */
     const auto lane = threadIdx.x;
     const auto n_threads_per_warp = 32;
-    const auto n_blocks = gridDim.x; // 1 for this case only
+    const auto n_blocks = gridDim.x; // 1 for this case only, and 1 block as well
 
-    const uint32_t img_size_rounded = (img_size / n_blocks) * n_blocks;    
-
-    for (uint64_t i = 0; i < img_size_rounded; i += n_blocks) {
+    for (uint64_t i = 0; i < img_size; i += n_blocks) {
         for (uint64_t j = lane; j < img_size; j += n_threads_per_warp) {
             float cx = (float(j) / float(img_size)) * window_zoom + window_x;
             float cy = (float(i) / float(img_size)) * window_zoom + window_y;
@@ -238,6 +236,98 @@ __global__ void mandelbrot_gpu_vector_multicore_multithread_full_ilp(
     uint32_t *out /* pointer to GPU memory */
 ) {
     /* your (GPU) code here... */
+
+    constexpr auto n_ilp_parallel = 4;
+
+    const auto n_threads_per_warp = 32;
+    const auto lane = threadIdx.x % n_threads_per_warp;
+    const auto warp = threadIdx.x / n_threads_per_warp;
+    const auto warps_per_block = blockDim.x / n_threads_per_warp;
+    const auto block = blockIdx.x;
+    const auto n_blocks = gridDim.x;
+    const auto n_warps = n_blocks * warps_per_block;
+
+    for (uint32_t i = block * warps_per_block + warp; i < img_size; i += n_warps) {
+        for (uint32_t jj = lane; jj < img_size; jj += n_threads_per_warp * n_ilp_parallel) {
+            float cx_arr[n_ilp_parallel] = {0};
+            float cy_arr[n_ilp_parallel] = {0};
+            float x2_arr[n_ilp_parallel] = {0};
+            float y2_arr[n_ilp_parallel] = {0};
+            float w_arr[n_ilp_parallel] = {0};
+            uint32_t iters_arr[n_ilp_parallel] = {0};
+
+            #pragma unroll n_ilp_parallel
+            for (uint32_t j_ = 0; j_ < n_ilp_parallel; ++j_) {
+                auto j = jj + j_ * n_threads_per_warp;
+                if (j < img_size) {
+                    float cx = (float(j) / float(img_size)) * window_zoom + window_x;
+                    float cy = (float(i) / float(img_size)) * window_zoom + window_y;
+                    cx_arr[j_] = cx;
+                    cy_arr[j_] = cy;
+                }
+            }
+
+            bool todo[n_ilp_parallel];
+            #pragma unroll n_ilp_parallel
+            for (uint32_t j_ = 0; j_ < n_ilp_parallel; ++j_) {
+                todo[j_] = true;
+            } 
+
+            while (true) {
+                bool all_done = true;
+                #pragma unroll n_ilp_parallel
+                for (uint32_t j_ = 0; j_ < n_ilp_parallel; ++j_) {
+                    if (todo[j_]) {
+                        all_done = false;
+                        break;
+                    }
+                }
+                if (all_done) {
+                    #pragma unroll n_ilp_parallel
+                    for (uint32_t j_ = 0; j_ < n_ilp_parallel; ++j_) {
+                        auto j = jj + j_ * n_threads_per_warp;
+                        if (j < img_size) {
+                            out[i * img_size + j] = iters_arr[j_];
+                        }
+                    }
+                    break;
+                }
+
+                #pragma unroll n_ilp_parallel
+                for (uint32_t j_ = 0; j_ < n_ilp_parallel; ++j_) {
+                    if (!todo[j_]) {
+                        continue;
+                    }
+
+                    auto cx = cx_arr[j_];
+                    auto cy = cy_arr[j_];
+                    auto x2 = x2_arr[j_];
+                    auto y2 = y2_arr[j_];
+                    auto w = w_arr[j_];
+                    auto iters = iters_arr[j_];
+
+                    if (x2 + y2 <= 4.0f && iters < max_iters) {
+                        float x = x2 - y2 + cx;
+                        float y = w - (x2 + y2) + cy;
+                        x2 = x * x;
+                        y2 = y * y;
+                        float z = x + y;
+                        w = z * z;
+                        ++iters;
+
+                        cx_arr[j_] = cx;
+                        cy_arr[j_] = cy;
+                        x2_arr[j_] = x2;
+                        y2_arr[j_] = y2;
+                        w_arr[j_] = w;
+                        iters_arr[j_] = iters;
+                    } else {
+                        todo[j_] = false;
+                    }
+                }
+            }
+        }
+    }
 }
 
 void launch_mandelbrot_gpu_vector_multicore_multithread_full_ilp(
@@ -246,6 +336,9 @@ void launch_mandelbrot_gpu_vector_multicore_multithread_full_ilp(
     uint32_t *out /* pointer to GPU memory */
 ) {
     /* your (CPU) code here... */
+    constexpr auto n_warps = 8;
+    constexpr auto n_threads_per_warp = 32;
+    mandelbrot_gpu_vector_multicore_multithread_full_ilp<<<142, n_warps * n_threads_per_warp>>>(img_size, max_iters, out);
 }
 
 /// <--- /your code here --->
