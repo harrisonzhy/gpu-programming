@@ -32,6 +32,16 @@ __attribute__((optimize("O0"))) __global__ void l1_mem_latency(
         "mov.u64 %1, %%clock64;\n\t"
 
         // <!-- TODO: your code here -->
+        
+        // warmup by loading into L2 then L1
+        "ld.global.ca.f32 %2, [%5];\n\t"
+        "membar.gl;\n\t"
+
+        // reset time
+        "mov.u64 %1, %%clock64;\n\t"
+
+        "ld.global.ca.f32 %2, [%5];\n\t"
+        "membar.gl;\n\t"
 
         "mov.u64 %4, %%clock64;\n\t"
 
@@ -67,6 +77,8 @@ __attribute__((optimize("O0"))) __global__ void l2_mem_latency(
         "mov.u64 %1, %%clock64;\n\t"
 
         // <!-- TODO: your code here -->
+        "ld.global.cg.f32 %2, [%5];\n\t"
+        "membar.gl;\n\t"
 
         "mov.u64 %4, %%clock64;\n\t"
 
@@ -94,9 +106,12 @@ __attribute__((optimize("O0"))) __global__ void global_mem_latency(
     asm volatile(
         // Measure memory load latency directly - no warm-up access
         "membar.gl;\n\t"
+        
         "mov.u64 %0, %%clock64;\n\t"
 
         // <!-- TODO: your code here -->
+        "ld.global.ca.f32 %1, [%3];\n\t"
+        "membar.gl;\n\t"
 
         "mov.u64 %4, %%clock64;\n\t"
         "st.global.f32 [%3], %1;\n\t"
