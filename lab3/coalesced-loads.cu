@@ -24,16 +24,27 @@ static constexpr size_t kNumOfInnerIterations = 3;
 // Non-Coalesced Memory Access Pattern
 
 __global__ void non_coalesced_load(data_type *dst, data_type *src, int x) {
+    const auto block_base = blockIdx.x * (x * blockDim.x);
+    const auto thread_base = block_base + x * threadIdx.x;
 
     // <!-- TODO: your code here -->
+    for (auto i = 0; i < x; ++i) {
+        auto idx = thread_base + i;
+        dst[idx] = src[idx];
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 // Coalesced Memory Access Pattern
 
 __global__ void coalesced_load(data_type *dst, data_type *src, int x) {
+    const auto block_base = blockIdx.x * (x * blockDim.x);
 
     // <!-- TODO: your code here -->
+    for (auto i = 0; i < x * blockDim.x; i += blockDim.x) {
+        auto idx = block_base + threadIdx.x + i;
+        dst[idx] = src[idx];
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
