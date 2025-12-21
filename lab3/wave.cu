@@ -120,6 +120,51 @@ __global__ void wave_gpu_naive_step(
     float const *u1 /* pointer to GPU memory */
 ) {
     /* TODO: your GPU code here... */
+
+    constexpr int32_t n_cells_x = Scene::n_cells_x;
+    constexpr int32_t n_cells_y = Scene::n_cells_y;
+    constexpr float c = Scene::c;
+    constexpr float dx = Scene::dx;
+    constexpr float dt = Scene::dt;
+
+    const auto threads_per_block = blockDim.x;
+    const auto num_threads_per_warp = 32;
+    const auto num_blocks = gridDim.x;
+    const auto warps_per_block = threads_per_block / num_threads_per_warp;
+    const auto num_warps = num_blocks * warps_per_block;
+
+    const auto block = blockIdx.x;
+    const auto warp = threadIdx.x / num_threads_per_warp;
+    const auto lane = threadIdx.x % num_threads_per_warp;
+
+    for (int32_t idx_y = block * warps_per_block + warp; idx_y < n_cells_y; idx_y += num_warps) {
+        for (int32_t idx_xx = 0; idx_xx < n_cells_x; idx_xx += 32) {
+            int32_t idx_x = idx_xx + lane;
+            if (idx_x >= n_cells_x) {
+                continue;
+            }
+            int32_t idx = idx_y * n_cells_x + idx_x;
+            bool is_border =
+                (idx_x == 0 || idx_x == n_cells_x - 1 || idx_y == 0 ||
+                 idx_y == n_cells_y - 1);
+            float u_next_val;
+            if (is_border || Scene::is_wall(idx_x, idx_y)) {
+                u_next_val = 0.0f;
+            } else if (Scene::is_source(idx_x, idx_y)) {
+                u_next_val = Scene::source_value(idx_x, idx_y, t);
+            } else {
+                constexpr float coeff = c * c * dt * dt / (dx * dx);
+                float damping = Scene::damping(idx_x, idx_y);
+                u_next_val =
+                    ((2.0f - damping - 4.0f * coeff) * u1[idx] -
+                     (1.0f - damping) * u0[idx] +
+                     coeff *
+                         (u1[idx - 1] + u1[idx + 1] + u1[idx - n_cells_x] +
+                          u1[idx + n_cells_x]));
+            }
+            u0[idx] = u_next_val;
+        }
+    }
 }
 
 // 'wave_gpu_naive':
@@ -147,6 +192,14 @@ std::pair<float *, float *> wave_gpu_naive(
     float *u1  /* pointer to GPU memory */
 ) {
     /* TODO: your CPU code here... */
+    constexpr auto num_blocks = 142;
+    constexpr auto threads_per_block = 32 * 4;
+
+    for (int32_t idx_step = 0; idx_step < n_steps; idx_step++) {
+        float t = t0 + idx_step * Scene::dt;
+        wave_gpu_naive_step<Scene><<<num_blocks, threads_per_block>>>(t, u0, u1);
+        std::swap(u0, u1);
+    }
     return {u0, u1};
 }
 
