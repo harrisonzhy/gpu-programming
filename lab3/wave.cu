@@ -210,7 +210,7 @@ template <typename Scene>
 __global__ void wave_gpu_shmem_multistep_tile(
     /* TODO: your arguments here... */
     float t0, // base timestep
-    float step0, // current timestep for this chunk
+    int32_t step0, // current timestep for this chunk
     float* u0,
     float* u1,
     float* extra0,
@@ -374,94 +374,11 @@ __global__ void wave_gpu_shmem_multistep_tile(
     }
 }
 
-// 'wave_gpu_shmem':
-//
-// Input:
-//
-//     t0 -- initial time coordinate
-//
-//     n_steps -- number of time steps to simulate
-//
-//     u(t0 - dt) in GPU array 'u0' of size 'n_cells_y * n_cells_x'
-///
-//     u(t0) in GPU array 'u1' of size 'n_cells_y * n_cells_x'
-//
-//     Scratch buffers 'extra0' and 'extra1' of size 'n_cells_y * n_cells_x'
-//
-// Output:
-//
-//     Launches kernels to (potentially) overwrite the GPU memory pointed to
-//     by 'u0' and 'u1', 'extra0', and 'extra1'.
-//
-//     Returns pointers to GPU buffers which will contain the final states of
-//     the wave u(t0 + (n_steps - 1) * dt) and u(t0 + n_steps * dt) after all
-//     launched kernels have completed. These buffers can be any of 'u0', 'u1',
-//     'extra0', or 'extra1'.
-//
 template <typename Scene>
-std::pair<float *, float *> wave_gpu_shmem_tile(
-    float t0,
-    int32_t n_steps,
-    float *u0,     /* pointer to GPU memory */
-    float *u1,     /* pointer to GPU memory */
-    float *extra0, /* pointer to GPU memory */
-    float *extra1  /* pointer to GPU memory */
-) {
-    /* TODO: your CPU code here... */
-    
-    // Params:
-    //  1. blockDim.x 1-32
-    //  2. blockDim.y 1-32
-    //  3. K, size of timestep chunk
-    //  4. T, pixels per thread
-    constexpr int32_t config[4] = {32, 32, 16, 2};
-    // constexpr int32_t config[4] = {20, 20, 6, 1};
-    // constexpr int32_t config[4] = {16, 16, 4, 8};
-
-    constexpr auto W = config[0];
-    constexpr auto H = config[1];
-    constexpr auto K = config[2];
-    constexpr auto T = config[3];
-
-    constexpr auto scratch_x = W + 2 * K;
-    constexpr auto scratch_y = H + 2 * K;
-
-    auto ceil_div = [](int32_t a, int32_t b) -> int32_t { return (a + b - 1) / b; };
-
-    dim3 grid(ceil_div(Scene::n_cells_x, W), ceil_div(Scene::n_cells_y, H), 1);
-    dim3 block(ceil_div(scratch_x, T), ceil_div(scratch_y, T), 1);
-    constexpr uint32_t shmem_size = 3 * scratch_x * scratch_y * sizeof(float);
-
-    const auto nsteps_full = (n_steps / K) * K;
-
-    float* in0 = u0;
-    float* in1 = u1;
-    float* out0 = extra0;
-    float* out1 = extra1;
-    for (int32_t idx_step = 0; idx_step < nsteps_full; idx_step += K) {
-        wave_gpu_shmem_multistep_tile<Scene><<<grid, block, shmem_size>>>(t0, idx_step, in0, in1, out0, out1, W, H, K, T);
-        std::swap(in0, out0);
-        std::swap(in1, out1);
-    }
-    u0 = in0;
-    u1 = in1;
-    for (int32_t idx_step = nsteps_full; idx_step < n_steps; ++idx_step) {
-        constexpr auto num_blocks = 142;
-        constexpr auto threads_per_block = 32 * 4;
-        
-        float t = t0 + idx_step * Scene::dt;
-        wave_gpu_naive_step<Scene><<<num_blocks, threads_per_block>>>(t, u0, u1);
-        std::swap(u0, u1);
-    }
-
-    return {u0, u1};
-}
-
-template <typename Scene>
-__global__ void wave_gpu_shmem_multistep(
+__global__ void wave_gpu_shmem_multistep_biject(
     /* TODO: your arguments here... */
     float t0, // base timestep
-    float step0, // current timestep for this chunk
+    int32_t step0, // current timestep for this chunk
     float* u0,
     float* u1,
     float* extra0,
@@ -599,6 +516,7 @@ __global__ void wave_gpu_shmem_multistep(
 //     launched kernels have completed. These buffers can be any of 'u0', 'u1',
 //     'extra0', or 'extra1'.
 //
+
 template <typename Scene>
 std::pair<float *, float *> wave_gpu_shmem(
     float t0,
@@ -609,7 +527,66 @@ std::pair<float *, float *> wave_gpu_shmem(
     float *extra1  /* pointer to GPU memory */
 ) {
     /* TODO: your CPU code here... */
-    constexpr int32_t config[3] = {24, 24, 4};
+    
+    // Params:
+    //  1. blockDim.x 1-32
+    //  2. blockDim.y 1-32
+    //  3. K, size of timestep chunk
+    //  4. T, pixels per thread (along one dim)
+    constexpr int32_t config[4] = {64, 32, 4, 2}; // 1.66x improvement over naive
+    // constexpr int32_t config[4] = {20, 20, 6, 1};
+    // constexpr int32_t config[4] = {16, 16, 4, 8};
+
+    constexpr auto W = config[0];
+    constexpr auto H = config[1];
+    constexpr auto K = config[2];
+    constexpr auto T = config[3];
+
+    constexpr auto scratch_x = W + 2 * K;
+    constexpr auto scratch_y = H + 2 * K;
+
+    auto ceil_div = [](int32_t a, int32_t b) -> int32_t { return (a + b - 1) / b; };
+
+    dim3 grid(ceil_div(Scene::n_cells_x, W), ceil_div(Scene::n_cells_y, H), 1);
+    dim3 block(ceil_div(scratch_x, T), ceil_div(scratch_y, T), 1);
+    constexpr uint32_t shmem_size = 3 * scratch_x * scratch_y * sizeof(float);
+
+    const auto nsteps_full = (n_steps / K) * K;
+
+    float* in0 = u0;
+    float* in1 = u1;
+    float* out0 = extra0;
+    float* out1 = extra1;
+    for (int32_t idx_step = 0; idx_step < nsteps_full; idx_step += K) {
+        wave_gpu_shmem_multistep_tile<Scene><<<grid, block, shmem_size>>>(t0, idx_step, in0, in1, out0, out1, W, H, K, T);
+        std::swap(in0, out0);
+        std::swap(in1, out1);
+    }
+    u0 = in0;
+    u1 = in1;
+    for (int32_t idx_step = nsteps_full; idx_step < n_steps; ++idx_step) {
+        constexpr auto num_blocks = 142;
+        constexpr auto threads_per_block = 32 * 4;
+        
+        float t = t0 + idx_step * Scene::dt;
+        wave_gpu_naive_step<Scene><<<num_blocks, threads_per_block>>>(t, u0, u1);
+        std::swap(u0, u1);
+    }
+
+    return {u0, u1};
+}
+
+template <typename Scene>
+std::pair<float *, float *> wave_gpu_shmem_biject(
+    float t0,
+    int32_t n_steps,
+    float *u0,     /* pointer to GPU memory */
+    float *u1,     /* pointer to GPU memory */
+    float *extra0, /* pointer to GPU memory */
+    float *extra1  /* pointer to GPU memory */
+) {
+    /* TODO: your CPU code here... */
+    constexpr int32_t config[3] = {24, 24, 4}; // 1.42x improvement over naive
     // constexpr int32_t config[3] = {20, 20, 6};
     // constexpr int32_t config[3] = {16, 16, 8};
 
@@ -628,7 +605,7 @@ std::pair<float *, float *> wave_gpu_shmem(
     float* out0 = extra0;
     float* out1 = extra1;
     for (int32_t idx_step = 0; idx_step < nsteps_full; idx_step += K) {
-        wave_gpu_shmem_multistep<Scene><<<grid, block, shmem_size>>>(t0, idx_step, in0, in1, out0, out1, W, H, K);
+        wave_gpu_shmem_multistep_biject<Scene><<<grid, block, shmem_size>>>(t0, idx_step, in0, in1, out0, out1, W, H, K);
         std::swap(in0, out0);
         std::swap(in1, out1);
     }
