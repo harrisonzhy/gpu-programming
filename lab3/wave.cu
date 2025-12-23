@@ -399,7 +399,7 @@ __global__ void wave_gpu_shmem_multistep_tile(
 //     'extra0', or 'extra1'.
 //
 template <typename Scene>
-std::pair<float *, float *> wave_gpu_shmem(
+std::pair<float *, float *> wave_gpu_shmem_tile(
     float t0,
     int32_t n_steps,
     float *u0,     /* pointer to GPU memory */
