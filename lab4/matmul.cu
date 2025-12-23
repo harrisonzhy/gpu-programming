@@ -24,23 +24,23 @@ void cuda_check(cudaError_t code, const char *file, int line) {
 ////////////////////////////////////////////////////////////////////////////////
 // CPU Reference Implementation (Too slow to actually run!)
 //
-// void matmul_cpu_naive(
-//     int32_t size_i,
-//     int32_t size_j,
-//     int32_t size_k,
-//     float const *a,
-//     float const *b,
-//     float *c) {
-//     for (int32_t i = 0; i < size_i; ++i) {
-//         for (int32_t j = 0; j < size_j; ++j) {
-//             float sum = 0.0;
-//             for (int32_t k = 0; k < size_k; ++k) {
-//                 sum += a[i * size_k + k] * b[k * size_j + j];
-//             }
-//             c[i * size_j + j] = sum;
-//         }
-//     }
-// }
+void matmul_cpu_naive(
+    int32_t size_i,
+    int32_t size_j,
+    int32_t size_k,
+    float const *a,
+    float const *b,
+    float *c) {
+    for (int32_t i = 0; i < size_i; ++i) {
+        for (int32_t j = 0; j < size_j; ++j) {
+            float sum = 0.0;
+            for (int32_t k = 0; k < size_k; ++k) {
+                sum += a[i * size_k + k] * b[k * size_j + j];
+            }
+            c[i * size_j + j] = sum;
+        }
+    }
+}
 
 /// <--- your code here --->
 
@@ -48,6 +48,12 @@ void cuda_check(cudaError_t code, const char *file, int line) {
 // GPU Implementation (With Reuse in L1/Shmem)
 
 namespace matmul_l1 {
+
+static constexpr int32_t T = 1; // thread processes TxT output tile
+static constexpr int32_t W = 32;
+static constexpr int32_t H = 32;
+static constexpr int32_t SHARED_W = 32;
+static constexpr int32_t SHARED_H = 32;
 
 __global__ void matmul_l1(
     int32_t size_i,
@@ -57,6 +63,34 @@ __global__ void matmul_l1(
     float const *b,
     float *c) {
     /* TODO: your GPU code here */
+
+    const int32_t tile_height = blockDim.y * T;
+    const int32_t tile_width = blockDim.x * T;
+    
+    const int32_t i0 = tile_height * blockIdx.y;
+    const int32_t j0 = tile_width * blockIdx.x;
+
+    const int32_t ti0 = threadIdx.y * T;
+    const int32_t tj0 = threadIdx.x * T;
+
+    for (int32_t ii = 0; ii < T; ++ii) {
+        const int32_t i = i0 + ti0 + ii;
+        if (i >= size_i) {
+            continue;
+        }
+        for (int32_t jj = 0; jj < T; ++jj) {
+            const int32_t j = j0 + tj0 + jj;
+            if (j >= size_j) {
+                continue;
+            }
+
+            float result = 0;
+            for (int32_t k = 0; k < size_k; ++k) {
+                result += a[i * size_k + k] * b[k * size_j + j];
+            }
+            c[i * size_j + j] = result;
+        }
+    }
 }
 
 void launch_matmul_l1(
@@ -67,6 +101,14 @@ void launch_matmul_l1(
     float const *b,
     float *c) {
     /* TODO: your CPU code here */
+
+    auto ceil_div = [](int32_t a, int32_t b) -> int32_t { return (a + b - 1) / b; };
+
+    dim3 grid(ceil_div(size_i, matmul_l1::W), ceil_div(size_k, matmul_l1::H), 1);
+    dim3 block(ceil_div(matmul_l1::SHARED_W, T), ceil_div(matmul_l1::SHARED_H, T), 1);
+    // constexpr uint32_t shmem_size = 3 * scratch_x * scratch_y * sizeof(float);
+
+    matmul_l1<<<grid, block>>>(size_i, size_j, size_k, a, b, c);
 }
 
 }; // namespace matmul_l1
