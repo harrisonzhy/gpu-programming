@@ -518,7 +518,7 @@ __global__ void wave_gpu_shmem_multistep_biject(
 //
 
 template <typename Scene>
-std::pair<float *, float *> wave_gpu_shmem(
+std::pair<float *, float *> wave_gpu_shmem_(
     float t0,
     int32_t n_steps,
     float *u0,     /* pointer to GPU memory */
@@ -533,7 +533,11 @@ std::pair<float *, float *> wave_gpu_shmem(
     //  2. blockDim.y 1-32
     //  3. K, size of timestep chunk
     //  4. T, pixels per thread (along one dim)
-    constexpr int32_t config[4] = {64, 32, 4, 2}; // 1.66x improvement over naive
+
+    // 1.66x improvement over naive
+    //  This config uses 66x32x4x3x4=101376 bytes as scratchpad, out of 128 KiB
+    constexpr int32_t config[4] = {66, 32, 4, 2};
+    
     // constexpr int32_t config[4] = {20, 20, 6, 1};
     // constexpr int32_t config[4] = {16, 16, 4, 8};
 
@@ -577,7 +581,7 @@ std::pair<float *, float *> wave_gpu_shmem(
 }
 
 template <typename Scene>
-std::pair<float *, float *> wave_gpu_shmem_biject(
+std::pair<float *, float *> wave_gpu_shmem(
     float t0,
     int32_t n_steps,
     float *u0,     /* pointer to GPU memory */
@@ -586,7 +590,15 @@ std::pair<float *, float *> wave_gpu_shmem_biject(
     float *extra1  /* pointer to GPU memory */
 ) {
     /* TODO: your CPU code here... */
+
+    // Params:
+    //  1. blockDim.x 1-32
+    //  2. blockDim.y 1-32
+    //  3. K, size of timestep chunk
+
+    //  This config uses 24x24x4=2304 bytes as scratchpad, out of 128 KiB
     constexpr int32_t config[3] = {24, 24, 4}; // 1.42x improvement over naive
+
     // constexpr int32_t config[3] = {20, 20, 6};
     // constexpr int32_t config[3] = {16, 16, 8};
 
