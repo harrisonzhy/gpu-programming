@@ -535,9 +535,7 @@ std::pair<float *, float *> wave_gpu_shmem(
     //  4. T, pixels per thread (along one dim)
 
     // 1.66x improvement over naive
-    //  This config uses 66x32x4x3x4=101376 bytes as scratchpad, out of 128 KiB
     constexpr int32_t config[4] = {66, 32, 4, 2};
-    
     // constexpr int32_t config[4] = {20, 20, 6, 1};
     // constexpr int32_t config[4] = {16, 16, 4, 8};
 
@@ -596,9 +594,7 @@ std::pair<float *, float *> wave_gpu_shmem_biject(
     //  2. blockDim.y 1-32
     //  3. K, size of timestep chunk
 
-    //  This config uses 24x24x4=2304 bytes as scratchpad, out of 128 KiB
     constexpr int32_t config[3] = {24, 24, 4}; // 1.42x improvement over naive
-
     // constexpr int32_t config[3] = {20, 20, 6};
     // constexpr int32_t config[3] = {16, 16, 8};
 
