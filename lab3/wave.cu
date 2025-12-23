@@ -518,7 +518,7 @@ __global__ void wave_gpu_shmem_multistep_biject(
 //
 
 template <typename Scene>
-std::pair<float *, float *> wave_gpu_shmem_(
+std::pair<float *, float *> wave_gpu_shmem(
     float t0,
     int32_t n_steps,
     float *u0,     /* pointer to GPU memory */
@@ -581,7 +581,7 @@ std::pair<float *, float *> wave_gpu_shmem_(
 }
 
 template <typename Scene>
-std::pair<float *, float *> wave_gpu_shmem(
+std::pair<float *, float *> wave_gpu_shmem_biject(
     float t0,
     int32_t n_steps,
     float *u0,     /* pointer to GPU memory */
