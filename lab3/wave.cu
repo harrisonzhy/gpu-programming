@@ -141,7 +141,7 @@ __global__ void wave_gpu_naive_step(
         for (int32_t idx_xx = 0; idx_xx < n_cells_x; idx_xx += 32) {
             int32_t idx_x = idx_xx + lane;
             if (idx_x >= n_cells_x) {
-                continue;
+                break;
             }
             int32_t idx = idx_y * n_cells_x + idx_x;
             bool is_border =
@@ -209,8 +209,119 @@ std::pair<float *, float *> wave_gpu_naive(
 template <typename Scene>
 __global__ void wave_gpu_shmem_multistep(
     /* TODO: your arguments here... */
+    float t0, // base timestep
+    float step0, // current timestep for this chunk
+    float* u0,
+    float* u1,
+    float* extra0,
+    float* extra1,
+    int32_t W, // output tile width
+    int32_t H, // output tile height
+    int32_t K // timestep chunk (num substeps)
 ) {
     /* TODO: your GPU code here... */
+
+    constexpr int32_t n_cells_x = Scene::n_cells_x;
+    constexpr int32_t n_cells_y = Scene::n_cells_y;
+    constexpr float c = Scene::c;
+    constexpr float dx = Scene::dx;
+    constexpr float dt = Scene::dt;
+
+    const int32_t SHARED_W = W + 2 * K;
+    const int32_t SHARED_H = H + 2 * K;
+
+    // need 3 buffers here because we need prev and curr to make next
+    extern __shared__ float shared_mem[];
+    float* tile_prev = shared_mem;
+    float* tile_curr = shared_mem + (SHARED_W * SHARED_H);
+    float* tile_next = shared_mem + (2 * SHARED_W * SHARED_H);
+
+    auto shared_index = [SHARED_W](int32_t xx, int32_t yy) -> int32_t {
+        return yy * SHARED_W + xx;
+    };
+
+    // note: currently, each thread gets one tile
+    //  1. tile indices are wrt the halo
+    //  2. therefore, tile indices are offset by -K from the output
+
+    // get indices in the shared tiles (wrt halo start)
+    const int32_t shared_tile_x = threadIdx.x;
+    const int32_t shared_tile_y = threadIdx.y;
+    const int32_t shared_linear = shared_index(shared_tile_x, shared_tile_y);
+
+    // get global indices (wrt halo start)
+    const int32_t global_cell_x = blockIdx.x * W + (threadIdx.x - K);
+    const int32_t global_cell_y = blockIdx.y * H + (threadIdx.y - K);
+
+    const bool global_bound_ok = (0 <= global_cell_x && global_cell_x < n_cells_x) 
+                              && (0 <= global_cell_y && global_cell_y < n_cells_y);
+    
+    // load scratchpad for this block
+    int32_t global_linear = 0;
+    if (global_bound_ok) {
+        global_linear = global_cell_y * n_cells_x + global_cell_x;
+        tile_prev[shared_linear] = u0[global_linear];
+        tile_curr[shared_linear] = u1[global_linear];
+    } else {
+        tile_prev[shared_linear] = 0;
+        tile_curr[shared_linear] = 0;
+    }
+
+    // sync scratchpad load
+    __syncthreads();
+
+    for (int32_t substep = 0; substep < K; ++substep) {
+        const int32_t margin = substep + 1; // the valid region shrinks by 1 with each step
+        const float t = t0 + (step0 + substep) * Scene::dt;
+
+        const bool shared_bound_ok = (shared_tile_x >= margin && shared_tile_x + margin < SHARED_W)
+                            && (shared_tile_y >= margin && shared_tile_y + margin < SHARED_H);
+
+        float u_next_val = tile_curr[shared_linear];
+        if (global_bound_ok && shared_bound_ok) {
+            bool is_border =
+                (global_cell_x == 0 || global_cell_x == n_cells_x - 1 
+              || global_cell_y == 0 || global_cell_y == n_cells_y - 1);
+            if (is_border || Scene::is_wall(global_cell_x, global_cell_y)) {
+                u_next_val = 0.0f;
+            } else if (Scene::is_source(global_cell_x, global_cell_y)) {
+                u_next_val = Scene::source_value(global_cell_x, global_cell_y, t);
+            } else {
+                constexpr float coeff = c * c * dt * dt / (dx * dx);
+                const float damping = Scene::damping(global_cell_x, global_cell_y);
+
+                const float u_center = tile_curr[shared_linear];
+                const float u_left = tile_curr[shared_index(shared_tile_x - 1, shared_tile_y)];
+                const float u_right = tile_curr[shared_index(shared_tile_x + 1, shared_tile_y)];
+                const float u_up = tile_curr[shared_index(shared_tile_x, shared_tile_y - 1)];
+                const float u_down = tile_curr[shared_index(shared_tile_x, shared_tile_y + 1)];
+
+                u_next_val =
+                    (2.0f - damping - 4.0f * coeff) * u_center
+                    - (1.0f - damping) * tile_prev[shared_linear]
+                    + coeff * (u_left + u_right + u_up + u_down);
+            }
+        }
+        tile_next[shared_linear] = u_next_val;
+
+        // swap buffers
+        float* tmp = tile_prev;
+        tile_prev = tile_curr;
+        tile_curr = tile_next;
+        tile_next = tmp;
+
+        // sync current/prev tile over this block
+        __syncthreads();
+    }
+
+    // only write to output if within the KxK
+    const bool is_output_thread = (shared_tile_x >= K && shared_tile_x < K + W 
+                                && shared_tile_y >= K && shared_tile_y < K + H);
+
+    if (global_bound_ok && is_output_thread) { 
+        extra0[global_linear] = tile_prev[shared_linear];
+        extra1[global_linear] = tile_curr[shared_linear];
+    }
 }
 
 // 'wave_gpu_shmem':
@@ -247,6 +358,40 @@ std::pair<float *, float *> wave_gpu_shmem(
     float *extra1  /* pointer to GPU memory */
 ) {
     /* TODO: your CPU code here... */
+    constexpr int32_t config[3] = {24, 24, 4};
+    // constexpr int32_t config[3] = {20, 20, 6};
+    // constexpr int32_t config[3] = {16, 16, 8};
+
+    constexpr auto W = config[0];
+    constexpr auto H = config[1];
+    constexpr auto K = config[2];
+
+    dim3 grid((Scene::n_cells_x + W - 1) / W, (Scene::n_cells_y + H - 1) / H, 1);
+    dim3 block(W + 2 * K, H + 2 * K, 1);
+    constexpr uint32_t shmem_size = 3 * (W + 2 * K) * (H + 2 * K) * sizeof(float);
+
+    const auto nsteps_full = (n_steps / K) * K;
+
+    float* in0 = u0;
+    float* in1 = u1;
+    float* out0 = extra0;
+    float* out1 = extra1;
+    for (int32_t idx_step = 0; idx_step < nsteps_full; idx_step += K) {
+        wave_gpu_shmem_multistep<Scene><<<grid, block, shmem_size>>>(t0, idx_step, in0, in1, out0, out1, W, H, K);
+        std::swap(in0, out0);
+        std::swap(in1, out1);
+    }
+    u0 = in0;
+    u1 = in1;
+    for (int32_t idx_step = nsteps_full; idx_step < n_steps; ++idx_step) {
+        constexpr auto num_blocks = 142;
+        constexpr auto threads_per_block = 32 * 4;
+        
+        float t = t0 + idx_step * Scene::dt;
+        wave_gpu_naive_step<Scene><<<num_blocks, threads_per_block>>>(t, u0, u1);
+        std::swap(u0, u1);
+    }
+
     return {u0, u1};
 }
 
