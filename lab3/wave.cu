@@ -379,10 +379,10 @@ __global__ void wave_gpu_shmem_multistep_biject(
     /* TODO: your arguments here... */
     float t0, // base timestep
     int32_t step0, // current timestep for this chunk
-    float* u0,
-    float* u1,
-    float* extra0,
-    float* extra1,
+    const float* __restrict__ u0,
+    const float* __restrict__ u1,
+    float* __restrict__ extra0,
+    float* __restrict__ extra1,
     int32_t W, // output tile width
     int32_t H, // output tile height
     int32_t K // timestep chunk (num substeps)
