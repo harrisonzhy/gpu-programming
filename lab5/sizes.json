@@ -1,0 +1,62 @@
+[
+  {
+    "size_i": 1,
+    "size_j": 3072,
+    "size_k": 3072
+  },
+  {
+    "size_i": 16,
+    "size_j": 3072,
+    "size_k": 3072
+  },
+  {
+    "size_i": 32,
+    "size_j": 3072,
+    "size_k": 3072
+  },
+  {
+    "size_i": 64,
+    "size_j": 3072,
+    "size_k": 3072
+  },
+  {
+    "size_i": 128,
+    "size_j": 3072,
+    "size_k": 3072
+  },
+  {
+    "size_i": 256,
+    "size_j": 3072,
+    "size_k": 3072
+  },
+  {
+    "size_i": 512,
+    "size_j": 3072,
+    "size_k": 3072
+  },
+  {
+    "size_i": 3072,
+    "size_j": 3072,
+    "size_k": 3072
+  },
+  {
+    "size_i": 256,
+    "size_j": 256,
+    "size_k": 256
+  },
+  {
+    "size_i": 256,
+    "size_j": 256,
+    "size_k": 1024
+  },
+  {
+    "size_i": 256,
+    "size_j": 256,
+    "size_k": 8192
+  },
+  {
+    "size_i": 128,
+    "size_j": 128,
+    "size_k": 32768
+  }
+]
