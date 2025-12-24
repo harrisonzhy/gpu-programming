@@ -119,17 +119,17 @@ __global__ void matmul_l1(
         }
 
         __syncthreads();
+    }
 
-        // writeback results to DRAM
-        for (int32_t ii = 0; ii < T; ++ii) {
-            for (int32_t jj = 0; jj < T; ++jj) {
-                const int32_t i = block_i0 + thread_i0 + ii;
-                const int32_t j = block_j0 + thread_j0 + jj;
-                if (i >= size_i || j >= size_j) {
-                    continue;
-                }
-                c[i * size_j + j] = results[ii * T + jj];
+    // writeback results to DRAM
+    for (int32_t ii = 0; ii < T; ++ii) {
+        for (int32_t jj = 0; jj < T; ++jj) {
+            const int32_t i = block_i0 + thread_i0 + ii;
+            const int32_t j = block_j0 + thread_j0 + jj;
+            if (i >= size_i || j >= size_j) {
+                continue;
             }
+            c[i * size_j + j] = results[ii * T + jj];
         }
     }
 }
@@ -159,6 +159,11 @@ void launch_matmul_l1(
 
 namespace matmul_l1_reg {
 
+static constexpr int32_t T = 4; // thread processes TxT output tile
+static constexpr int32_t W = 32;
+static constexpr int32_t H = 32;
+static constexpr int32_t K = 32;
+
 __global__ void matmul_l1_reg(
     int32_t size_i,
     int32_t size_j,
@@ -167,6 +172,86 @@ __global__ void matmul_l1_reg(
     float const *b,
     float *c) {
     /* TODO: your GPU code here */
+
+    extern __shared__ float shared_mem[];
+    float* shared_a = shared_mem;
+    float* shared_b = shared_mem + K * K;
+
+    // global indices
+    const int32_t tile_height = blockDim.y * T;
+    const int32_t tile_width = blockDim.x * T;
+    const int32_t block_i0 = tile_height * blockIdx.y;
+    const int32_t block_j0 = tile_width * blockIdx.x;
+    const int32_t thread_i0 = threadIdx.y * T;
+    const int32_t thread_j0 = threadIdx.x * T;
+
+    float results[T * T] = {0};
+
+    for (int32_t block_k0 = 0; block_k0 < size_k; block_k0 += K) {
+        // load scratchpad with elements of A and B
+        for (int32_t shared_base = threadIdx.y * blockDim.x + threadIdx.x; 
+                     shared_base < K * K; 
+                     shared_base += blockDim.x * blockDim.y) {
+            const int32_t row = shared_base / K;
+            const int32_t col = shared_base % K;
+
+            // indices to load A
+            const int32_t global_i = block_i0 + row;
+            const int32_t global_k = block_k0 + col;
+
+            // indices to load B
+            const int32_t global_k_ = block_k0 + row;
+            const int32_t global_j = block_j0 + col;
+
+            if (global_i < size_i && global_k < size_k) {
+                shared_a[shared_base] = a[global_i * size_k + global_k];
+            } else {
+                shared_a[shared_base] = 0;
+            }
+            if (global_k_ < size_k && global_j < size_j) {
+                shared_b[shared_base] = b[global_k_ * size_j + global_j];
+            } else {
+                shared_b[shared_base] = 0;
+            }
+        }
+
+        __syncthreads();
+
+        // to exploit register reuse, do outer product
+        for (int32_t kk = 0; kk < K; ++kk) {
+            float reg_a[T];
+            float reg_b[T];
+
+            for (int32_t ii = 0; ii < T; ++ii) {
+                const int32_t row = thread_i0 + ii;
+                reg_a[ii] = shared_a[row * K + kk];
+            }
+            for (int32_t jj = 0; jj < T; ++jj) {
+                const int32_t col = thread_j0 + jj;
+                reg_b[jj] = shared_b[kk * K + col];
+            }
+
+            for (int32_t ii = 0; ii < T; ++ii) {
+                for (int32_t jj = 0; jj < T; ++jj) {
+                    results[ii * T + jj] += reg_a[ii] * reg_b[jj];
+                }
+            }
+        }
+
+        __syncthreads();
+    }
+
+    // writeback results to DRAM
+    for (int32_t ii = 0; ii < T; ++ii) {
+        for (int32_t jj = 0; jj < T; ++jj) {
+            const int32_t i = block_i0 + thread_i0 + ii;
+            const int32_t j = block_j0 + thread_j0 + jj;
+            if (i >= size_i || j >= size_j) {
+                continue;
+            }
+            c[i * size_j + j] = results[ii * T + jj];
+        }
+    }
 }
 
 void launch_matmul_l1_reg(
@@ -177,6 +262,14 @@ void launch_matmul_l1_reg(
     float const *b,
     float *c) {
     /* TODO: your CPU code here */
+
+    auto ceil_div = [](int32_t a, int32_t b) -> int32_t { return (a + b - 1) / b; };
+
+    dim3 grid(ceil_div(size_i, matmul_l1_reg::W), ceil_div(size_k, matmul_l1_reg::H), 1);
+    dim3 block(ceil_div(matmul_l1_reg::K, T), ceil_div(matmul_l1_reg::K, T), 1);
+
+    static constexpr int32_t shmem_size = 2 * K * K * sizeof(float);
+    matmul_l1_reg<<<grid, block, shmem_size>>>(size_i, size_j, size_k, a, b, c);
 }
 
 }; // namespace matmul_l1_reg
