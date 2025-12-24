@@ -29,7 +29,23 @@ template <int TILE> __global__ void memcpy(float *dst, const float *src) {
 // Prelab Question 3: Fill in the shared memory sizes you want to run the
 // kernel with. Changing these values will limit the occupancy of the kernel.
 ////////////////////////////////////////////////////////////////////////////////
-inline std::vector<int> shared_memory_configuration() { return {0}; }
+inline std::vector<int> shared_memory_configuration() {
+    // L40S (Ada):
+    //  Max of 48 resident warps per SM
+    //  Max of 128KB per SM, but 100KB provisionable as shared memory
+    //  https://docs.nvidia.com/cuda/ada-tuning-guide/index.html
+
+    // Then,
+    //  Threads per block = 64, so 2 warps per block
+    //  So 32 blocks per SM, so 4KB per block or 2KB per warp
+
+    // Shared memory sizes (account for additional 1024 bytes reserved by CUDA for each block)
+    // 20% occupancy -> 102400 bytes / round_to_mul2_warps(0.2 * 48 warps) * (2 warps per block) - 1024
+    // 50% occupancy -> 102400 bytes / round_to_mul2_warps(0.5 * 48 warps) * (2 warps per block) - 1024
+    // 80% occupancy -> 102400 bytes / round_to_mul2_warps(0.8 * 48 warps) * (2 warps per block) - 1024
+
+    return {19456 /* 20.8 */, 7509 /* 45.8 */, 4096 /* 83.3 */};
+}
 
 ////////////////////////////////////////////////////////////////////////////////
 // Main
