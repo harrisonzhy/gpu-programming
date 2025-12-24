@@ -72,11 +72,14 @@ __global__ void matmul_l1(
     const int32_t tile_width = blockDim.x * T;
     const int32_t block_i0 = tile_height * blockIdx.y;
     const int32_t block_j0 = tile_width * blockIdx.x;
+
+    // thread offset/scratchpad indices
     const int32_t thread_i0 = threadIdx.y * T;
     const int32_t thread_j0 = threadIdx.x * T;
 
     float results[T * T] = {0};
 
+    // accumulate outer product in chunks of K
     for (int32_t block_k0 = 0; block_k0 < size_k; block_k0 += K) {
         // load scratchpad with elements of A and B
         for (int32_t shared_base = threadIdx.y * blockDim.x + threadIdx.x; 
@@ -182,6 +185,8 @@ __global__ void matmul_l1_reg(
     const int32_t tile_width = blockDim.x * T;
     const int32_t block_i0 = tile_height * blockIdx.y;
     const int32_t block_j0 = tile_width * blockIdx.x;
+
+    // offset/scratchpad indices
     const int32_t thread_i0 = threadIdx.y * T;
     const int32_t thread_j0 = threadIdx.x * T;
 
