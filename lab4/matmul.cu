@@ -270,10 +270,10 @@ void launch_matmul_l1_reg(
 
     auto ceil_div = [](int32_t a, int32_t b) -> int32_t { return (a + b - 1) / b; };
 
-    dim3 grid(ceil_div(size_i, matmul_l1_reg::W), ceil_div(size_k, matmul_l1_reg::H), 1);
     dim3 block(ceil_div(matmul_l1_reg::K, T), ceil_div(matmul_l1_reg::K, T), 1);
-
-    static constexpr int32_t shmem_size = 2 * K * K * sizeof(float);
+    dim3 grid(ceil_div(size_j, matmul_l1_reg::W), ceil_div(size_i, matmul_l1_reg::H), 1);
+    
+    static constexpr int32_t shmem_size = 2 * matmul_l1_reg::K * matmul_l1_reg::K * sizeof(float);
     matmul_l1_reg<<<grid, block, shmem_size>>>(size_i, size_j, size_k, a, b, c);
 }
 
