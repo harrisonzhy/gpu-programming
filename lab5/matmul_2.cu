@@ -80,7 +80,7 @@ static constexpr int32_t W = 32;
 static constexpr int32_t H = 32;
 static constexpr int32_t K = 32;
 
-__global__ void matmul_l1_reg(
+__global__ void __launch_bounds__(64, 2) matmul_l1_reg(
     int32_t size_i,
     int32_t size_j,
     int32_t size_k,
@@ -183,10 +183,10 @@ void launch_matmul_l1_reg(
 
     auto ceil_div = [](int32_t a, int32_t b) -> int32_t { return (a + b - 1) / b; };
 
-    dim3 block(ceil_div(matmul_l1_reg::K, T), ceil_div(matmul_l1_reg::K, T), 1);
-    dim3 grid(ceil_div(size_j, matmul_l1_reg::W), ceil_div(size_i, matmul_l1_reg::H), 1);
+    dim3 block(ceil_div(K, T), ceil_div(K, T), 1);
+    dim3 grid(ceil_div(size_j, W), ceil_div(size_i, H), 1);
     
-    static constexpr int32_t shmem_size = 2 * matmul_l1_reg::K * matmul_l1_reg::K * sizeof(float);
+    static constexpr int32_t shmem_size = 2 * K * K * sizeof(float);
     matmul_l1_reg<<<grid, block, shmem_size>>>(size_i, size_j, size_k, a, b, c);
 }
 
@@ -197,6 +197,28 @@ void launch_matmul_l1_reg(
 
 namespace matmul_improved {
 
+static constexpr int32_t T = 4; // thread processes TxT output tile
+static constexpr int32_t W = 32;
+static constexpr int32_t H = 32;
+static constexpr int32_t K = 32;
+
+__device__ __forceinline__
+void cp_async_float4(float* smem_dst, const float* gmem_src, bool ignore_src) {
+    unsigned smem_addr = __cvta_generic_to_shared(smem_dst);
+    unsigned long long gmem_addr = reinterpret_cast<unsigned long long>(gmem_src);
+    int pred = ignore_src ? 1 : 0;
+
+    asm volatile(
+        "{ .reg .pred p;\n"
+        "  setp.ne.b32 p, %2, 0;\n"
+        "  cp.async.ca.shared.global [%0], [%1], 4, p;\n"
+        "}\n"
+        :
+        : "r"(smem_addr), "l"(gmem_addr), "r"(pred)
+        : "memory"
+    );
+}
+
 __global__ void matmul_improved(
     int32_t size_i,
     int32_t size_j,
@@ -205,6 +227,90 @@ __global__ void matmul_improved(
     float const *b, /* pointer to GPU memory */
     float *c /* pointer to GPU memory */) {
     /* TODO: your GPU code here */
+
+    extern __shared__ float shared_mem[];
+    float* shared_a = shared_mem;
+    float* shared_b = shared_mem + K * K;
+
+    // global indices
+    const int32_t tile_height = blockDim.y * T;
+    const int32_t tile_width = blockDim.x * T;
+    const int32_t block_i0 = tile_height * blockIdx.y;
+    const int32_t block_j0 = tile_width * blockIdx.x;
+
+    // offset/scratchpad indices
+    const int32_t thread_i0 = threadIdx.y * T;
+    const int32_t thread_j0 = threadIdx.x * T;
+
+    float results[T * T] = {0};
+
+    for (int32_t block_k0 = 0; block_k0 < size_k; block_k0 += K) {
+        // load scratchpad with elements of A and B
+        for (int32_t shared_base = threadIdx.y * blockDim.x + threadIdx.x; 
+                    shared_base < K * K; 
+                    shared_base += blockDim.x * blockDim.y) {
+            const int32_t row = shared_base / K;
+            const int32_t col = shared_base % K;
+
+            // indices to load A
+            const int32_t global_i = block_i0 + row;
+            const int32_t global_k = block_k0 + col;
+
+            // indices to load B
+            const int32_t global_k_ = block_k0 + row;
+            const int32_t global_j = block_j0 + col;
+
+            // async copy
+            bool a_oob = !(global_i < size_i && global_k < size_k);
+            bool b_oob = !(global_k_ < size_k && global_j < size_j);
+
+            const float* a_src = (a_oob) ? a : &a[global_i * size_k + global_k];
+            const float* b_src = (b_oob) ? b : &b[global_k_ * size_j + global_j];
+
+            cp_async_float4(&shared_a[shared_base], a_src, a_oob);
+            cp_async_float4(&shared_b[shared_base], b_src, b_oob);
+        }
+
+        asm volatile("cp.async.commit_group;\n" ::: "memory");
+        asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+
+        __syncthreads();
+
+        // to exploit register reuse, do outer product
+        for (int32_t kk = 0; kk < K; ++kk) {
+            float reg_a[T];
+            float reg_b[T];
+
+            for (int32_t ii = 0; ii < T; ++ii) {
+                const int32_t row = thread_i0 + ii;
+                reg_a[ii] = shared_a[row * K + kk];
+            }
+            for (int32_t jj = 0; jj < T; ++jj) {
+                const int32_t col = thread_j0 + jj;
+                reg_b[jj] = shared_b[kk * K + col];
+            }
+
+            for (int32_t ii = 0; ii < T; ++ii) {
+                for (int32_t jj = 0; jj < T; ++jj) {
+                    results[ii * T + jj] += reg_a[ii] * reg_b[jj];
+                }
+            }
+        }
+
+        __syncthreads();
+    }
+
+    // writeback results to DRAM
+    for (int32_t ii = 0; ii < T; ++ii) {
+        for (int32_t jj = 0; jj < T; ++jj) {
+            const int32_t i = block_i0 + thread_i0 + ii;
+            const int32_t j = block_j0 + thread_j0 + jj;
+            if (i >= size_i || j >= size_j) {
+                continue;
+            }
+            c[i * size_j + j] = results[ii * T + jj];
+        }
+    }
 }
 
 void launch_matmul_improved(
@@ -215,6 +321,19 @@ void launch_matmul_improved(
     float const *b, /* pointer to GPU memory */
     float *c /* pointer to GPU memory */) {
     /* TODO: your CPU code here */
+
+    auto ceil_div = [](int32_t a, int32_t b) -> int32_t { return (a + b - 1) / b; };
+
+    dim3 block(ceil_div(K, T), ceil_div(K, T), 1);
+    dim3 grid(ceil_div(size_j, W), ceil_div(size_i, H), 1);
+    
+    static constexpr int32_t shmem_size = 2 * K * K * sizeof(float);
+    matmul_improved<<<grid, block, shmem_size>>>(size_i, size_j, size_k, a, b, c);
+
+    cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) printf("launch error: %s\n", cudaGetErrorString(e));
+    e = cudaDeviceSynchronize();
+    if (e != cudaSuccess) printf("sync error: %s\n", cudaGetErrorString(e));
 }
 
 }; // namespace matmul_improved
