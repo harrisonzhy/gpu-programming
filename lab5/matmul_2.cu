@@ -199,10 +199,10 @@ static constexpr int32_t T = 4; // thread processes TxT output tile
 static constexpr int32_t K = 64;
 
 __device__ __forceinline__
-void cp_async_float4(float* smem_dst, const float* gmem_src, bool ignore_src) {
+void cp_async_float(float* smem_dst, const float* gmem_src, bool ignore_src) {
     unsigned smem_addr = __cvta_generic_to_shared(smem_dst);
     unsigned long long gmem_addr = reinterpret_cast<unsigned long long>(gmem_src);
-    int pred = ignore_src ? 1 : 0;
+    int32_t pred = ignore_src ? 1 : 0;
 
     asm volatile(
         "{ .reg .pred p;\n"
@@ -263,8 +263,8 @@ __global__ void matmul_improved(
             const float* a_src = (a_oob) ? a : &a[global_i * size_k + global_k];
             const float* b_src = (b_oob) ? b : &b[global_k_ * size_j + global_j];
 
-            cp_async_float4(&shared_a[shared_base], a_src, a_oob);
-            cp_async_float4(&shared_b[shared_base], b_src, b_oob);
+            cp_async_float(&shared_a[shared_base], a_src, a_oob);
+            cp_async_float(&shared_b[shared_base], b_src, b_oob);
         }
 
         async_commit_group();
@@ -338,7 +338,7 @@ static constexpr int32_t T = 4; // thread processes TxT output tile
 static constexpr int32_t K = 64;
 
 __device__ __forceinline__
-void cp_async_float4(float* smem_dst, const float* gmem_src, bool ignore_src) {
+void cp_async_float(float* smem_dst, const float* gmem_src, bool ignore_src) {
     unsigned smem_addr = __cvta_generic_to_shared(smem_dst);
     unsigned long long gmem_addr = reinterpret_cast<unsigned long long>(gmem_src);
     int pred = ignore_src ? 1 : 0;
@@ -347,6 +347,23 @@ void cp_async_float4(float* smem_dst, const float* gmem_src, bool ignore_src) {
         "{ .reg .pred p;\n"
         "  setp.ne.b32 p, %2, 0;\n"
         "  cp.async.ca.shared.global [%0], [%1], 4, p;\n"
+        "}\n"
+        :
+        : "r"(smem_addr), "l"(gmem_addr), "r"(pred)
+        : "memory"
+    );
+}
+
+__device__ __forceinline__
+void cp_async_float4(float* smem_dst, const float* gmem_src, bool ignore_src) {
+    unsigned smem_addr = __cvta_generic_to_shared(smem_dst);
+    unsigned long long gmem_addr = reinterpret_cast<unsigned long long>(gmem_src);
+    int pred = ignore_src ? 1 : 0;
+
+    asm volatile(
+        "{ .reg .pred p;\n"
+        "  setp.ne.b32 p, %2, 0;\n"
+        "  cp.async.ca.shared.global [%0], [%1], 16, p;\n"
         "}\n"
         :
         : "r"(smem_addr), "l"(gmem_addr), "r"(pred)
@@ -378,41 +395,29 @@ __global__ void matmul_improved_reduce(
         return;
     }
 
-    extern __shared__ float shared_mem[];
+    extern __shared__ __align__(16) float shared_mem[];
     float* shared_a = shared_mem;
     float* shared_b = shared_mem + K * K;
 
     int32_t shared_base = threadIdx.y * blockDim.x + threadIdx.x;
-    int32_t K_sq_rounded = (K * K / 4) * 4;
-
-    for (; shared_base < K_sq_rounded; shared_base += blockDim.x * blockDim.y) {
-        const int32_t row = shared_base / K;
-        const int32_t col = shared_base % K;
+    for (; shared_base < K * K / 4; shared_base += blockDim.x * blockDim.y) {
+        const int32_t base = shared_base * 4;
+        const int32_t row = base / K;
+        const int32_t col = base % K;
 
         const int32_t global_i = block_i0 + row;
         const int32_t global_j = block_j0 + col;
         const int32_t global_k = block_k0 + col;
         const int32_t global_k_ = block_k0 + row;
 
-        const bool a_oob = !(global_i < size_i && global_k < size_k);
-        const bool b_oob = !(global_k_ < size_k && global_j < size_j);
+        const bool a_oob = !(global_i < size_i && global_k + 3 < size_k);
+        const bool b_oob = !(global_k_ < size_k && global_j + 3 < size_j);
 
         const float* a_src = (a_oob) ? a : &a[global_i * size_k + global_k];
         const float* b_src = (b_oob) ? b : &b[global_k_ * size_j + global_j];
 
-        cp_async_float4(&shared_a[shared_base], a_src, a_oob);
-        cp_async_float4(&shared_b[shared_base], b_src, b_oob);
-    }
-    for (; shared_base < K * K; shared_base += blockDim.x * blockDim.y) {
-        const int32_t row = shared_base / K;
-        const int32_t col = shared_base % K;
-
-        const int32_t global_i = block_i0 + row;
-        const int32_t global_j = block_j0 + col;
-        const int32_t global_k = block_k0 + col;
-        const int32_t global_k_ = block_k0 + row;
-        shared_a[shared_base] = a[global_i * size_k + global_k];
-        shared_b[shared_base] = b[global_k_ * size_j + global_j];
+        cp_async_float4(&shared_a[base], a_src, a_oob);
+        cp_async_float4(&shared_b[base], b_src, b_oob);
     }
 
     async_commit_group();
@@ -420,7 +425,6 @@ __global__ void matmul_improved_reduce(
     __syncthreads();
 
     float partial_sums_reg[T * T] = {0};
-
     for (int32_t kk = 0; kk < K; ++kk) {
         float reg_a[T];
         float reg_b[T];
@@ -439,20 +443,37 @@ __global__ void matmul_improved_reduce(
         }
     }
 
-    __syncthreads();
+    static_assert(T == 4);
 
     // writeback to DRAM
-    for (int32_t ii = 0; ii < T; ++ii) {
-        for (int32_t jj = 0; jj < T; ++jj) {
-            const int32_t i = block_i0 + thread_i0 + ii;
-            const int32_t j = block_j0 + thread_j0 + jj;
-            if (i >= size_i || j >= size_j) {
+    const int32_t i0 = block_i0 + thread_i0;
+    const int32_t j0 = block_j0 + thread_j0;
+
+    const bool full_tile = (i0 + 3) < size_i && (j0 + 3) < size_j;
+    float* out = partial_sums + slice * (size_i * size_j);
+
+    if (full_tile) {
+        for (int32_t idx = 0; idx < T; ++idx) {
+            float4 v = *reinterpret_cast<float4*>(&partial_sums_reg[idx * 4]);
+            *reinterpret_cast<float4*>(&out[(i0 + idx) * size_j + j0]) = v;
+        }
+    } else {
+        for (int32_t ii = 0; ii < T; ++ii) {
+            const int32_t i = i0 + ii;
+            if (i >= size_i) {
                 continue;
             }
-            const int32_t idx = i * size_j + j;
-            partial_sums[slice * (size_i * size_j) + idx] = partial_sums_reg[ii * T + jj];
+            for (int32_t jj = 0; jj < T; ++jj) {
+                const int32_t j = j0 + jj;
+                if (j >= size_j) {
+                    continue;
+                }
+                out[i * size_j + j] = partial_sums_reg[ii * 4 + jj];
+            }
         }
     }
+
+    __syncthreads();
 }
 
 __global__ void reduce_basic(
@@ -470,7 +491,7 @@ __global__ void reduce_basic(
     float sum = 0;
 
     const float* base = partial_sums + idx;
-    for (int s = 0; s < num_slices; ++s) {
+    for (int32_t s = 0; s < num_slices; ++s) {
         sum += base[s * (size_i * size_j)];
     }
 
