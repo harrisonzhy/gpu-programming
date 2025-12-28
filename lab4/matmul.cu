@@ -146,7 +146,7 @@ void launch_matmul_l1(
 
     auto ceil_div = [](int32_t a, int32_t b) -> int32_t { return (a + b - 1) / b; };
 
-    dim3 block(ceil_div(K, T), ceil_div(matmul_l1::K, T), 1);
+    dim3 block(ceil_div(K, T), ceil_div(K, T), 1);
     dim3 grid(ceil_div(size_i, block.x * T), ceil_div(size_j, block.y * T), 1);
 
     static constexpr int32_t shmem_size = 2 * K * K * sizeof(float);
