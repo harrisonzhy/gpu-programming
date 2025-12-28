@@ -76,11 +76,9 @@ template <int N> __device__ __forceinline__ void async_wait_pending() {
 namespace matmul_l1_reg {
 
 static constexpr int32_t T = 4; // thread processes TxT output tile
-static constexpr int32_t W = 32;
-static constexpr int32_t H = 32;
-static constexpr int32_t K = 32;
+static constexpr int32_t K = 64;
 
-__global__ void __launch_bounds__(64, 2) matmul_l1_reg(
+__global__ void matmul_l1_reg(
     int32_t size_i,
     int32_t size_j,
     int32_t size_k,
@@ -184,7 +182,7 @@ void launch_matmul_l1_reg(
     auto ceil_div = [](int32_t a, int32_t b) -> int32_t { return (a + b - 1) / b; };
 
     dim3 block(ceil_div(K, T), ceil_div(K, T), 1);
-    dim3 grid(ceil_div(size_j, W), ceil_div(size_i, H), 1);
+    dim3 grid(ceil_div(size_j, block.x * T), ceil_div(size_i, block.y * T), 1);
     
     static constexpr int32_t shmem_size = 2 * K * K * sizeof(float);
     matmul_l1_reg<<<grid, block, shmem_size>>>(size_i, size_j, size_k, a, b, c);
@@ -198,9 +196,7 @@ void launch_matmul_l1_reg(
 namespace matmul_improved {
 
 static constexpr int32_t T = 4; // thread processes TxT output tile
-static constexpr int32_t W = 32;
-static constexpr int32_t H = 32;
-static constexpr int32_t K = 32;
+static constexpr int32_t K = 64;
 
 __device__ __forceinline__
 void cp_async_float4(float* smem_dst, const float* gmem_src, bool ignore_src) {
@@ -325,7 +321,7 @@ void launch_matmul_improved(
     auto ceil_div = [](int32_t a, int32_t b) -> int32_t { return (a + b - 1) / b; };
 
     dim3 block(ceil_div(K, T), ceil_div(K, T), 1);
-    dim3 grid(ceil_div(size_j, W), ceil_div(size_i, H), 1);
+    dim3 grid(ceil_div(size_j, block.x * T), ceil_div(size_i, block.y * T), 1);
     
     static constexpr int32_t shmem_size = 2 * K * K * sizeof(float);
     matmul_improved<<<grid, block, shmem_size>>>(size_i, size_j, size_k, a, b, c);

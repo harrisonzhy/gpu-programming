@@ -49,10 +49,8 @@ void matmul_cpu_naive(
 
 namespace matmul_l1 {
 
-static constexpr int32_t T = 2; // thread processes TxT output tile
-static constexpr int32_t W = 32;
-static constexpr int32_t H = 32;
-static constexpr int32_t K = 32;
+static constexpr int32_t T = 4; // thread processes TxT output tile
+static constexpr int32_t K = 64;
 
 __global__ void matmul_l1(
     int32_t size_i,
@@ -148,8 +146,8 @@ void launch_matmul_l1(
 
     auto ceil_div = [](int32_t a, int32_t b) -> int32_t { return (a + b - 1) / b; };
 
-    dim3 grid(ceil_div(size_i, matmul_l1::W), ceil_div(size_k, matmul_l1::H), 1);
-    dim3 block(ceil_div(matmul_l1::K, T), ceil_div(matmul_l1::K, T), 1);
+    dim3 block(ceil_div(K, T), ceil_div(matmul_l1::K, T), 1);
+    dim3 grid(ceil_div(size_i, block.x * T), ceil_div(size_j, block.y * T), 1);
 
     static constexpr int32_t shmem_size = 2 * K * K * sizeof(float);
     matmul_l1<<<grid, block, shmem_size>>>(size_i, size_j, size_k, a, b, c);
@@ -163,9 +161,7 @@ void launch_matmul_l1(
 namespace matmul_l1_reg {
 
 static constexpr int32_t T = 4; // thread processes TxT output tile
-static constexpr int32_t W = 32;
-static constexpr int32_t H = 32;
-static constexpr int32_t K = 32;
+static constexpr int32_t K = 64;
 
 __global__ void matmul_l1_reg(
     int32_t size_i,
@@ -270,10 +266,10 @@ void launch_matmul_l1_reg(
 
     auto ceil_div = [](int32_t a, int32_t b) -> int32_t { return (a + b - 1) / b; };
 
-    dim3 block(ceil_div(matmul_l1_reg::K, T), ceil_div(matmul_l1_reg::K, T), 1);
-    dim3 grid(ceil_div(size_j, matmul_l1_reg::W), ceil_div(size_i, matmul_l1_reg::H), 1);
+    dim3 block(ceil_div(K, T), ceil_div(K, T), 1);
+    dim3 grid(ceil_div(size_j, block.x * T), ceil_div(size_i, block.y * T), 1);
     
-    static constexpr int32_t shmem_size = 2 * matmul_l1_reg::K * matmul_l1_reg::K * sizeof(float);
+    static constexpr int32_t shmem_size = 2 * K * K * sizeof(float);
     matmul_l1_reg<<<grid, block, shmem_size>>>(size_i, size_j, size_k, a, b, c);
 }
 
