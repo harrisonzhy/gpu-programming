@@ -30,6 +30,57 @@ constexpr int32_t mma_size_k = 8;
 
 __global__ void mma_16x8x8_kernel(float const *a, float const *b, float *c) {
     // TODO: your GPU code here (using inline PTX)
+
+    const int32_t lane = threadIdx.x;
+
+    // A (16x8), B (8x8), C/D (16x8) for D <- AB + C
+    const int32_t cd_idx[4] = {2 * lane, 2 * lane + 1, 2 * lane + 64, 2 * lane + 65};
+
+    const int32_t a_idx[4] = {(lane / 4) * 8 + (lane % 4) + 0, 
+                              (lane / 4) * 8 + (lane % 4) + 64, 
+                              (lane / 4) * 8 + (lane % 4) + 4, 
+                              (lane / 4) * 8 + (lane % 4) + 68};
+
+    const int32_t b_idx[2] = {(lane % 4) * 8 + (lane / 4), ((lane % 4) + 4) * 8 + (lane / 4)};
+
+    uint32_t a_reg[4] = {
+        __float_as_uint(a[a_idx[0]]), 
+        __float_as_uint(a[a_idx[1]]),
+        __float_as_uint(a[a_idx[2]]),
+        __float_as_uint(a[a_idx[3]])
+    };
+    uint32_t b_reg[2] = {
+        __float_as_uint(b[b_idx[0]]),
+        __float_as_uint(b[b_idx[1]])
+    };
+    float c_reg[4] = {
+        c[cd_idx[0]],
+        c[cd_idx[1]],
+        c[cd_idx[2]],
+        c[cd_idx[3]]
+    };
+
+    asm volatile(
+        "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : 
+        "+f"(c_reg[0]),
+        "+f"(c_reg[1]),
+        "+f"(c_reg[2]),
+        "+f"(c_reg[3])
+        :
+        "r"(a_reg[0]),
+        "r"(a_reg[1]),
+        "r"(a_reg[2]),
+        "r"(a_reg[3]),
+        "r"(b_reg[0]),
+        "r"(b_reg[1])
+    );
+
+    c[cd_idx[0]] = c_reg[0];
+    c[cd_idx[1]] = c_reg[1];
+    c[cd_idx[2]] = c_reg[2];
+    c[cd_idx[3]] = c_reg[3];
 }
 
 /// <--- /your code here --->
