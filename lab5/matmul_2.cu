@@ -566,7 +566,7 @@ void launch_matmul_improved_reduce(
     }
 
     {
-        static constexpr int32_t num_threads = 1024;
+        static constexpr int32_t num_threads = 256;
         const int32_t num_blocks = ceil_div(size_i * size_j, num_threads);
         reduce_basic<<<num_blocks, num_threads>>>(size_i, size_j, num_slices, partial_sums, c);
         cudaError_t e = cudaGetLastError();
