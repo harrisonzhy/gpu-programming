@@ -363,7 +363,7 @@ void cp_async_float4(float* smem_dst, const float* gmem_src, bool ignore_src) {
     asm volatile(
         "{ .reg .pred p;\n"
         "  setp.ne.b32 p, %2, 0;\n"
-        "  cp.async.ca.shared.global [%0], [%1], 16, p;\n"
+        "  cp.async.cg.shared.global [%0], [%1], 16, p;\n"
         "}\n"
         :
         : "r"(smem_addr), "l"(gmem_addr), "r"(pred)
@@ -388,70 +388,94 @@ __global__ void matmul_improved_reduce(
     const auto thread_i0 = threadIdx.y * T;
     const auto thread_j0 = threadIdx.x * T;
     
-    const auto slice = blockIdx.z;
-    const int32_t block_k0 = slice * K;
+    const auto group = blockIdx.z;
+    const auto slice0 = 2 * group;
+    const auto slice1 = 2 * group + 1;
 
-    if (block_k0 >= size_k) {
+    const int32_t block_k0_0 = slice0 * K;
+    const int32_t block_k0_1 = slice1 * K;
+
+    if (block_k0_0 >= size_k) {
         return;
     }
 
     extern __shared__ __align__(16) float shared_mem[];
-    float* shared_a = shared_mem;
-    float* shared_b = shared_mem + K * K;
+    float* shared_a0 = shared_mem + 0 * K * K;
+    float* shared_b0 = shared_mem + 1 * K * K;
+    float* shared_a1 = shared_mem + 2 * K * K;
+    float* shared_b1 = shared_mem + 3 * K * K;
 
-    int32_t shared_base = threadIdx.y * blockDim.x + threadIdx.x;
-    for (; shared_base < K * K / 4; shared_base += blockDim.x * blockDim.y) {
-        const int32_t base = shared_base * 4;
-        const int32_t row = base / K;
-        const int32_t col = base % K;
+    auto do_cp_async = [&](int32_t block_k0, float* shared_a, float* shared_b) {
+        for (int32_t shared_base = threadIdx.y * blockDim.x + threadIdx.x; shared_base < K * K / 4; shared_base += blockDim.x * blockDim.y) {
+            const auto base = shared_base * 4;
+            const int32_t row = base / K;
+            const int32_t col = base % K;
 
-        const int32_t global_i = block_i0 + row;
-        const int32_t global_j = block_j0 + col;
-        const int32_t global_k = block_k0 + col;
-        const int32_t global_k_ = block_k0 + row;
+            const int32_t global_i = block_i0 + row;
+            const int32_t global_j = block_j0 + col;
+            const int32_t global_k = block_k0 + col;
+            const int32_t global_k_ = block_k0 + row;
 
-        const bool a_oob = !(global_i < size_i && global_k + 3 < size_k);
-        const bool b_oob = !(global_k_ < size_k && global_j + 3 < size_j);
+            const bool a_oob = !(global_i < size_i && global_k + 3 < size_k);
+            const bool b_oob = !(global_k_ < size_k && global_j + 3 < size_j);
 
-        const float* a_src = (a_oob) ? a : &a[global_i * size_k + global_k];
-        const float* b_src = (b_oob) ? b : &b[global_k_ * size_j + global_j];
+            const float* a_src = (a_oob) ? a : &a[global_i * size_k + global_k];
+            const float* b_src = (b_oob) ? b : &b[global_k_ * size_j + global_j];
 
-        cp_async_float4(&shared_a[base], a_src, a_oob);
-        cp_async_float4(&shared_b[base], b_src, b_oob);
-    }
+            cp_async_float4(&shared_a[base], a_src, a_oob);
+            cp_async_float4(&shared_b[base], b_src, b_oob);
+        }
+    };
 
+    do_cp_async(block_k0_0, shared_a0, shared_b0);
     async_commit_group();
-    async_wait_pending<0>();
-    __syncthreads();
 
-    float partial_sums_reg[T * T] = {0};
-    for (int32_t kk = 0; kk < K; ++kk) {
-        float reg_a[T];
-        float reg_b[T];
-        for (int32_t ii = 0; ii < T; ++ii) {
-            const int32_t row = thread_i0 + ii;
-            reg_a[ii] = shared_a[row * K + kk];
-        }
-        for (int32_t jj = 0; jj < T; ++jj) {
-            const int32_t col = thread_j0 + jj;
-            reg_b[jj] = shared_b[kk * K + col];
-        }
-        for (int32_t ii = 0; ii < T; ++ii) {
-            for (int32_t jj = 0; jj < T; ++jj) {
-                partial_sums_reg[ii * T + jj] += reg_a[ii] * reg_b[jj];
-            }
-        }
+    const bool has_k0_1 = (block_k0_1 < size_k);
+    if (has_k0_1) {
+        do_cp_async(block_k0_1, shared_a1, shared_b1);
+        async_commit_group(); 
     }
 
     static_assert(T == 4);
+    float partial_sums_reg[T * T] = {0};
+    auto compute_slice = [&](int32_t slice, const float* shared_a, const float* shared_b) {
+        for (int32_t kk = 0; kk < K; ++kk) {
+            float reg_a[T];
+            float reg_b[T];
+            for (int32_t ii = 0; ii < T; ++ii) {
+                const int32_t row = thread_i0 + ii;
+                reg_a[ii] = shared_a[row * K + kk];
+            }
+            for (int32_t jj = 0; jj < T; ++jj) {
+                const int32_t col = thread_j0 + jj;
+                reg_b[jj] = shared_b[kk * K + col];
+            }
+            for (int32_t ii = 0; ii < T; ++ii) {
+                for (int32_t jj = 0; jj < T; ++jj) {
+                    partial_sums_reg[ii * T + jj] += reg_a[ii] * reg_b[jj];
+                }
+            }
+        }
+    };
+
+    async_wait_pending<1>();
+    __syncthreads();
+    compute_slice(slice0, shared_a0, shared_b0);
+
+    if (has_k0_1) {
+        async_wait_pending<0>();
+        __syncthreads();
+        compute_slice(slice1, shared_a1, shared_b1);
+    }
 
     // writeback to DRAM
     const int32_t i0 = block_i0 + thread_i0;
     const int32_t j0 = block_j0 + thread_j0;
 
-    const bool full_tile = (i0 + 3) < size_i && (j0 + 3) < size_j;
-    float* out = partial_sums + slice * (size_i * size_j);
+    static_assert(T == 4);
 
+    const bool full_tile = (i0 + 3) < size_i && (j0 + 3) < size_j;
+    float* out = partial_sums + group * (size_i * size_j);
     if (full_tile) {
         for (int32_t idx = 0; idx < T; ++idx) {
             float4 v = *reinterpret_cast<float4*>(&partial_sums_reg[idx * 4]);
@@ -472,8 +496,6 @@ __global__ void matmul_improved_reduce(
             }
         }
     }
-
-    __syncthreads();
 }
 
 __global__ void reduce_basic(
@@ -498,49 +520,6 @@ __global__ void reduce_basic(
     c[idx] = sum;
 }
 
-__global__ void reduce(
-    int32_t size_i,
-    int32_t size_j,
-    int32_t num_slices,
-    const float *partial_sums, /* pointer to GPU memory */
-    float *c /* pointer to GPU memory */ 
-) {
-    const int32_t N = size_i * size_j;
-    const int32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= N) {
-        return;
-    }
-
-    extern __shared__ float shared_mem[];
-
-    float sum = 0;
-    for (int32_t slice_base = 0; slice_base < num_slices; slice_base += blockDim.y /* sheet stride */) {
-        const int32_t s = slice_base + threadIdx.y;
-
-        float v = 0;
-        if (s < num_slices) {
-            v = partial_sums[s * N + idx];
-        }
-
-        shared_mem[threadIdx.y * blockDim.x + threadIdx.x] = v;
-        __syncthreads();
-
-        if (threadIdx.y == 0) {
-            float chunk = 0;
-            // reduce along y-axis
-            for (int32_t yy = 0; yy < blockDim.y; ++yy) {
-                chunk += shared_mem[yy * blockDim.x + threadIdx.x];
-            }
-            sum += chunk;
-        }
-        __syncthreads();
-    }
-
-    if (threadIdx.y == 0) {
-        c[idx] = sum;
-    }
-}
-
 __forceinline__ int32_t ceil_div(int32_t a, int32_t b) {
     return (a + b - 1) / b;
 }
@@ -549,7 +528,7 @@ __forceinline__ int32_t ceil_div(int32_t a, int32_t b) {
 
 size_t get_workspace_size(int32_t size_i, int32_t size_j, int32_t size_k) {
     /* TODO: your CPU code here */
-    const int32_t num_psum_bufs = ceil_div(size_k, K);
+    const int32_t num_psum_bufs = ceil_div(ceil_div(size_k, K), 2);
     const int32_t num_elements = num_psum_bufs * size_i * size_j;
     return num_elements * sizeof(float);
 }
@@ -565,14 +544,14 @@ void launch_matmul_improved_reduce(
 ) {
     /* TODO: your CPU code here */
 
-    const int32_t num_slices = ceil_div(size_k, K);
+    const int32_t num_slices = ceil_div(ceil_div(size_k, K), 2);
     float* partial_sums = reinterpret_cast<float*>(workspace);
 
     {
         dim3 block(ceil_div(K, T), ceil_div(K, T), 1);
         dim3 grid(ceil_div(size_j, block.x * T), ceil_div(size_i, block.y * T), num_slices);
         
-        static constexpr int32_t shmem_size = 2 * K * K * sizeof(float);
+        static constexpr int32_t shmem_size = 2 * 2 * K * K * sizeof(float);
 
         cudaFuncSetAttribute(
             matmul_improved_reduce,
@@ -586,19 +565,6 @@ void launch_matmul_improved_reduce(
         }
     }
 
-    // Using fancier reduction
-    {
-        dim3 block_reduce(128, 8, 1);
-        const int32_t num_blocks = ceil_div(size_i * size_j, block_reduce.x);
-        const int32_t shmem_size = block_reduce.x * block_reduce.y * sizeof(float); 
-        reduce<<<num_blocks, block_reduce, shmem_size>>>(size_i, size_j, num_slices, partial_sums, c);
-        cudaError_t e = cudaGetLastError();
-        if (e != cudaSuccess) {
-            printf("Launch reduce error: %s\n", cudaGetErrorString(e));
-        }
-    }
-
-    /* // Using basic reduction
     {
         static constexpr int32_t num_threads = 1024;
         const int32_t num_blocks = ceil_div(size_i * size_j, num_threads);
@@ -608,7 +574,7 @@ void launch_matmul_improved_reduce(
             printf("Launch reduce error: %s\n", cudaGetErrorString(e));
         }
     }
-    */
+    
 }
 
 }; // namespace matmul_improved_reduce
