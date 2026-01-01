@@ -333,6 +333,9 @@ static constexpr int32_t K = 4;
 static constexpr int32_t WARP_A_ELEMS = K * PROB_A_ELEMS;
 static constexpr int32_t WARP_B_ELEMS = K * PROB_B_ELEMS;
 
+static constexpr int32_t warps_m = 4;
+static constexpr int32_t warps_n = 4;
+
 __host__ __device__ __forceinline__ int32_t ceil_div(int32_t a, int32_t b) {
     return (a + b - 1) / b;
 }
@@ -406,13 +409,10 @@ __global__ void matmul_improved_reduce(
     float *c, /* pointer to GPU memory */
     float *partial_sums /* pointer to GPU memory */
 ) {
-    // warps_m, warps_n is number of warps in this thread block
-    const int32_t warps_m = blockDim.y;
-    const int32_t warps_n = blockDim.z;
-    const int32_t warp_i = threadIdx.y; // which warp-row inside the block
-    const int32_t warp_j = threadIdx.z; // which warp-col inside the block
-    const int32_t warp = warp_i * warps_n + warp_j;
     const int32_t lane = threadIdx.x;
+    const int32_t warp_linear = threadIdx.y;
+    const int32_t warp_i = warp_linear / warps_n;
+    const int32_t warp_j = warp_linear % warps_n;
 
     // output C coords
     const int32_t block_i0 = blockIdx.x * (16 * warps_m);
@@ -422,22 +422,21 @@ __global__ void matmul_improved_reduce(
 
     extern __shared__ float shared_mem[];
 
-    float* shared_a_warp = shared_mem + warp * (WARP_A_ELEMS + WARP_B_ELEMS);
+    float* shared_a_warp = shared_mem + warp_linear * (WARP_A_ELEMS + WARP_B_ELEMS);
     float* shared_b_warp = shared_a_warp + WARP_A_ELEMS;
 
-    const int32_t cd_idx[4] = {2 * lane, 
-                            2 * lane + 1, 
-                            2 * lane + 64, 
-                            2 * lane + 65
-                        };
+    const int32_t cd_idx[4] = {2 * lane + 0, 
+                               2 * lane + 1, 
+                               2 * lane + 64, 
+                               2 * lane + 65};
     const int32_t a_idx[4] = {(lane / 4) * 8 + (lane % 4) + 0, 
-                            (lane / 4) * 8 + (lane % 4) + 64, 
-                            (lane / 4) * 8 + (lane % 4) + 4, 
-                            (lane / 4) * 8 + (lane % 4) + 68};
+                              (lane / 4) * 8 + (lane % 4) + 64, 
+                              (lane / 4) * 8 + (lane % 4) + 4, 
+                              (lane / 4) * 8 + (lane % 4) + 68};
     const int32_t b_idx[4] = {(lane % 4) * 16 + (lane / 4), 
-                            ((lane % 4) + 4) * 16 + (lane / 4),
-                            (lane % 4) * 16 + (8 + lane / 4),
-                            ((lane % 4) + 4) * 16 + (8 + lane / 4)};
+                              ((lane % 4) + 4) * 16 + (lane / 4),
+                              (lane % 4) * 16 + (8 + lane / 4),
+                              ((lane % 4) + 4) * 16 + (8 + lane / 4)};
 
     auto do_cp_async = [&](int32_t block_k0, float* shared_a, float* shared_b) {
         for (int32_t i = 0; i < 4; ++i) {
@@ -518,7 +517,6 @@ __global__ void matmul_improved_reduce(
         );
     };
 
-
     // load first K tiles
     for (int32_t t = 0; t < K; ++t) {
         int32_t k0 = t * 8;
@@ -564,13 +562,12 @@ __global__ void matmul_improved_reduce(
         const bool oob0 = !(global_i < size_i && global_j0 < size_j);
         const bool oob1 = !(global_i < size_i && global_j1 < size_j);
         if (!oob0) {
-            c[global_i * size_j + global_j0] = c_reg[t];
+            c[global_i * size_j + global_j0] += c_reg[t];
         }
         if (!oob1) {
-            c[global_i * size_j + global_j1] = c_reg[4 + t];
+            c[global_i * size_j + global_j1] += c_reg[4 + t];
         }
     }
-
 }
 
 size_t get_workspace_size(int32_t size_i, int32_t size_j, int32_t size_k) {
@@ -594,11 +591,11 @@ void launch_matmul_tensor(
 
     float *partial_sums = reinterpret_cast<float*>(workspace);
     const int32_t num_slices = ceil_div(size_k, 8);
+    const int32_t num_warps = warps_m * warps_n;
 
     {
-        dim3 block(32, 4, 4);
-        dim3 grid(ceil_div(size_i, 16 * block.y), ceil_div(size_j, 16 * block.z), 1);
-        const int32_t num_warps = block.y * block.z;
+        dim3 block(32, num_warps, 1);
+        dim3 grid(ceil_div(size_i, 16 * warps_m), ceil_div(size_j, 16 * warps_n), 1);
         const int32_t shmem_size = (WARP_A_ELEMS + WARP_B_ELEMS) * num_warps * sizeof(float);
         cudaFuncSetAttribute(
             matmul_improved_reduce,
