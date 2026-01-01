@@ -343,7 +343,7 @@ namespace matmul_tensor {
 static constexpr int32_t PROB_A_ELEMS = 16 * 8;
 static constexpr int32_t PROB_B_ELEMS = (8 * 8) * 2;
 
-static constexpr int32_t K = 6; // how many (16x8)x(2x8x8) tiles to process at once
+static constexpr int32_t K = 6; // how many (16x8)x((8x8)x2) tiles to process at once
 static constexpr int32_t K_BLOCK = 192;
 static constexpr int32_t warps_m = 4;
 static constexpr int32_t warps_n = 4;
