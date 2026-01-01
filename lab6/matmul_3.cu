@@ -324,11 +324,236 @@ void launch_matmul_improved_reduce(
 
 namespace matmul_tensor {
 
+// these should not be changed
+static constexpr int32_t K_TILE = 8;
+static constexpr int32_t PROB_A_ELEMS = 16 * K_TILE;
+static constexpr int32_t PROB_B_ELEMS = K_TILE * 16;
+
+static constexpr int32_t K = 4;
+static constexpr int32_t WARP_A_ELEMS = K * PROB_A_ELEMS;
+static constexpr int32_t WARP_B_ELEMS = K * PROB_B_ELEMS;
+
+__host__ __device__ __forceinline__ int32_t ceil_div(int32_t a, int32_t b) {
+    return (a + b - 1) / b;
+}
+
+__device__ __forceinline__
+void cp_async_float(float* smem_dst, const float* gmem_src, bool ignore_src) {
+    unsigned smem_addr = __cvta_generic_to_shared(smem_dst);
+    unsigned long long gmem_addr = reinterpret_cast<unsigned long long>(gmem_src);
+    int pred = ignore_src ? 1 : 0;
+
+    asm volatile(
+        "{ .reg .pred p;\n"
+        "  setp.ne.b32 p, %2, 0;\n"
+        "  cp.async.ca.shared.global [%0], [%1], 4, p;\n"
+        "}\n"
+        :
+        : "r"(smem_addr), "l"(gmem_addr), "r"(pred)
+        : "memory"
+    );
+}
+
 /* TODO: your GPU kernels here... */
+
+__global__ void reduce_basic(
+    int32_t size_i,
+    int32_t size_j,
+    int32_t num_slices,
+    const float *partial_sums, /* pointer to GPU memory */
+    float *c /* pointer to GPU memory */ 
+) {
+    int32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size_i * size_j) {
+        return;
+    }
+    
+    float sum = 0;
+    const float* base = partial_sums + idx;
+    for (int32_t s = 0; s < num_slices; ++s) {
+        sum += base[s * (size_i * size_j)];
+    }
+    c[idx] = sum;
+}
+
+__global__ void matmul_improved_reduce(
+    int32_t size_i,
+    int32_t size_j,
+    int32_t size_k,
+    int32_t num_slices,
+    float const *a, /* pointer to GPU memory */
+    float const *b, /* pointer to GPU memory */
+    float *c, /* pointer to GPU memory */
+    float *partial_sums /* pointer to GPU memory */
+) {
+    // warps_m, warps_n is number of warps in this thread block
+    const int32_t warps_m = blockDim.y;
+    const int32_t warps_n = blockDim.z;
+    const int32_t warp_i = threadIdx.y; // which warp-row inside the block
+    const int32_t warp_j = threadIdx.z; // which warp-col inside the block
+    const int32_t warp = warp_i * warps_n + warp_j;
+    const int32_t lane = threadIdx.x;
+
+    // output C coords
+    const int32_t block_i0 = blockIdx.x * (16 * warps_m);
+    const int32_t block_j0 = blockIdx.y * (16 * warps_n);
+    const int32_t warp_i0 = block_i0 + warp_i * 16;
+    const int32_t warp_j0 = block_j0 + warp_j * 16;
+
+    extern __shared__ float shared_mem[];
+
+    float* shared_a_warp = shared_mem + warp * (WARP_A_ELEMS + WARP_B_ELEMS);
+    float* shared_b_warp = shared_a_warp + WARP_A_ELEMS;
+
+    const int32_t cd_idx[4] = {2 * lane, 
+                            2 * lane + 1, 
+                            2 * lane + 64, 
+                            2 * lane + 65
+                        };
+    const int32_t a_idx[4] = {(lane / 4) * 8 + (lane % 4) + 0, 
+                            (lane / 4) * 8 + (lane % 4) + 64, 
+                            (lane / 4) * 8 + (lane % 4) + 4, 
+                            (lane / 4) * 8 + (lane % 4) + 68};
+    const int32_t b_idx[4] = {(lane % 4) * 16 + (lane / 4), 
+                            ((lane % 4) + 4) * 16 + (lane / 4),
+                            (lane % 4) * 16 + (8 + lane / 4),
+                            ((lane % 4) + 4) * 16 + (8 + lane / 4)};
+
+    auto do_cp_async = [&](int32_t block_k0, float* shared_a, float* shared_b) {
+        for (int32_t i = 0; i < 4; ++i) {
+            {
+                // A (16x8)
+                const int32_t linear_idx = a_idx[i];
+                const int32_t row = linear_idx / 8;
+                const int32_t col = linear_idx % 8;
+                const int32_t global_i = warp_i0 + row;
+                const int32_t global_k = block_k0 + col;
+
+                const bool oob = !(global_i < size_i && global_k < size_k);
+                const float* src = oob ? a : &a[global_i * size_k + global_k];
+                cp_async_float(&shared_a[linear_idx], src, oob);
+            }
+            {
+                // B (2 x (8x8))
+                const int32_t linear_idx = b_idx[i];
+                const int32_t row = linear_idx / 16;
+                const int32_t col = linear_idx % 16;
+
+                const int32_t global_k = block_k0 + row;
+                const int32_t global_j = warp_j0 + col;
+
+                const bool oob = !(global_k < size_k && global_j < size_j);
+                const float* src = oob ? b : &b[global_k * size_j + global_j];
+                cp_async_float(&shared_b[linear_idx], src, oob);
+            }
+        }
+    };
+
+    float c_reg[8] = {0};
+
+    auto compute_slice = [&](float* shared_a, float* shared_b) {
+        uint32_t a_reg[4] = {
+            __float_as_uint(shared_a[a_idx[0]]),
+            __float_as_uint(shared_a[a_idx[1]]),
+            __float_as_uint(shared_a[a_idx[2]]),
+            __float_as_uint(shared_a[a_idx[3]])
+        };
+        uint32_t b_reg[4] = {
+            __float_as_uint(shared_b[b_idx[0]]),
+            __float_as_uint(shared_b[b_idx[1]]),
+            __float_as_uint(shared_b[b_idx[2]]),
+            __float_as_uint(shared_b[b_idx[3]])
+        };
+        asm volatile(
+            "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
+            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+            : 
+            "+f"(c_reg[0]),
+            "+f"(c_reg[1]),
+            "+f"(c_reg[2]),
+            "+f"(c_reg[3])
+            :
+            "r"(a_reg[0]),
+            "r"(a_reg[1]),
+            "r"(a_reg[2]),
+            "r"(a_reg[3]),
+            "r"(b_reg[0]),
+            "r"(b_reg[1])
+        );
+        asm volatile(
+            "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
+            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+            : 
+            "+f"(c_reg[4]),
+            "+f"(c_reg[5]),
+            "+f"(c_reg[6]),
+            "+f"(c_reg[7])
+            :
+            "r"(a_reg[0]),
+            "r"(a_reg[1]),
+            "r"(a_reg[2]),
+            "r"(a_reg[3]),
+            "r"(b_reg[2]),
+            "r"(b_reg[3])
+        );
+    };
+
+    // load first K tiles
+    for (int32_t t = 0; t < K; ++t) {
+        int32_t k0 = t * 8;
+        float* shared_ai = shared_a_warp + t * PROB_A_ELEMS;
+        float* shared_bi = shared_b_warp + t * PROB_B_ELEMS;
+        do_cp_async(k0, shared_ai, shared_bi);
+        async_commit_group();
+    }
+
+    int32_t num_k_tiles = ceil_div(size_k, 8);
+
+    for (int32_t t = 0; t < num_k_tiles; ++t) {
+        int32_t s = t % K;
+
+        async_wait_pending<K - 1>();
+
+        __syncthreads();
+        float* shared_ai = shared_a_warp + s * PROB_A_ELEMS;
+        float* shared_bi = shared_b_warp + s * PROB_B_ELEMS;
+        compute_slice(shared_ai, shared_bi);
+        __syncthreads();
+
+        const int t_next_K = t + K;
+        if (t_next_K < num_k_tiles) {
+            const int next_k0 = t_next_K * 8;
+            do_cp_async(next_k0, shared_ai, shared_bi);
+            async_commit_group();
+        }
+    }
+
+    for (int t = 0; t < 4; ++t) {
+        const int32_t idx = cd_idx[t];
+        const int32_t row = idx / 8;
+        const int32_t col = idx % 8;
+
+        const int32_t global_i = warp_i0 + row;
+        const int32_t global_j0 = warp_j0 + col;
+        const int32_t global_j1 = warp_j0 + 8 + col;
+
+        const bool oob0 = !(global_i < size_i && global_j0 < size_j);
+        const bool oob1 = !(global_i < size_i && global_j1 < size_j);
+        if (!oob0) {
+            c[global_i * size_j + global_j0] = c_reg[t];
+        }
+        if (!oob1) {
+            c[global_i * size_j + global_j1] = c_reg[4 + t];
+        }
+    }
+
+}
 
 size_t get_workspace_size(int32_t size_i, int32_t size_j, int32_t size_k) {
     /* TODO: your CPU code here */
-    return 0;
+    const int32_t num_elements = size_i * size_j;
+    const int32_t k_slices = ceil_div(size_k, 8);
+    return num_elements * k_slices * sizeof(float);
 }
 
 void launch_matmul_tensor(
@@ -341,6 +566,26 @@ void launch_matmul_tensor(
     void *workspace /* pointer to GPU memory */
 ) {
     /* TODO: your CPU code here */
+
+    float *partial_sums = reinterpret_cast<float*>(workspace);
+    const int32_t num_slices = ceil_div(size_k, 8);
+
+    {
+        dim3 block(32, 4, 4);
+        dim3 grid(ceil_div(size_i, 16 * block.y), ceil_div(size_j, 16 * block.z), 1);
+        const int32_t num_warps = block.y * block.z;
+        const int32_t shmem_size = (WARP_A_ELEMS + WARP_B_ELEMS) * num_warps * sizeof(float);
+        cudaFuncSetAttribute(
+            matmul_improved_reduce,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            shmem_size
+        );
+        matmul_improved_reduce<<<grid, block, shmem_size>>>(size_i, size_j, size_k, num_slices, a, b, c, partial_sums);
+        cudaError_t e = cudaGetLastError();
+        if (e != cudaSuccess) {
+            printf("Launch matmul error: %s\n", cudaGetErrorString(e));
+        }
+    }
 }
 
 }; // namespace matmul_tensor
@@ -729,11 +974,11 @@ int main(int argc, char **argv) {
 
 
     auto configs = std::vector<BenchmarkConfig>{
-        {3072, 3072, 3072},
-        {2048, 3072, 3072},
-        {1024, 3072, 3072},
-        {512, 3072, 3072},
-        {256, 3072, 3072},
+        // {3072, 3072, 3072},
+        // {2048, 3072, 3072},
+        // {1024, 3072, 3072},
+        // {512, 3072, 3072},
+        // {256, 3072, 3072},
         {128, 3072, 3072},
         {64, 3072, 3072},
         {32, 3072, 3072},

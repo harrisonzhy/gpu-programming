@@ -574,7 +574,6 @@ void launch_matmul_improved_reduce(
             printf("Launch reduce error: %s\n", cudaGetErrorString(e));
         }
     }
-    
 }
 
 }; // namespace matmul_improved_reduce
