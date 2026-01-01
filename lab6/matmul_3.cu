@@ -117,6 +117,17 @@ void cp_async_float4(float* smem_dst, const float* gmem_src, bool ignore_src) {
     );
 }
 
+__device__ __forceinline__
+void cp_async_float4_(float* smem_dst, const float* gmem_src) {
+    unsigned smem_addr = __cvta_generic_to_shared(smem_dst);
+    unsigned long long gmem_addr = reinterpret_cast<unsigned long long>(gmem_src);
+    asm volatile(
+        "cp.async.cg.shared.global [%0], [%1], 16;\n"
+        :: "r"(smem_addr), "l"(gmem_addr)
+        : "memory"
+    );
+}
+
 // TODO: your GPU kernels here...
 
 __global__ void reduce_basic(
@@ -192,8 +203,12 @@ __global__ void matmul_improved_reduce(
             const float* a_src = (a_oob) ? a : &a[global_i * size_k + global_k];
             const float* b_src = (b_oob) ? b : &b[global_k_ * size_j + global_j];
 
-            cp_async_float4(&shared_a[base], a_src, a_oob);
-            cp_async_float4(&shared_b[base], b_src, b_oob);
+            if (!a_oob) {
+                cp_async_float4_(&shared_a[base], a_src);
+            }
+            if (!b_oob) {
+                cp_async_float4_(&shared_b[base], b_src);
+            }
         }
     };
 
@@ -328,11 +343,8 @@ namespace matmul_tensor {
 static constexpr int32_t PROB_A_ELEMS = 16 * 8;
 static constexpr int32_t PROB_B_ELEMS = (8 * 8) * 2;
 
-static constexpr int32_t K = 6; // how many (16x8)x(2x8x8) tiles to process at once
-static constexpr int32_t WARP_A_ELEMS = K * PROB_A_ELEMS;
-static constexpr int32_t WARP_B_ELEMS = K * PROB_B_ELEMS;
+static constexpr int32_t K = 8; // how many (16x8)x(2x8x8) tiles to process at once
 static constexpr int32_t K_BLOCK = 192;
-
 static constexpr int32_t warps_m = 4;
 static constexpr int32_t warps_n = 4;
 
@@ -431,10 +443,11 @@ __global__ void matmul_improved_reduce(
     const int32_t warp_i0 = block_i0 + warp_i * 16;
     const int32_t warp_j0 = block_j0 + warp_j * 16;
 
-    extern __shared__ float shared_mem[];
+    extern __shared__ __align__(16) float shared_mem[];
 
-    float* shared_a_warp = shared_mem + warp_linear * (WARP_A_ELEMS + WARP_B_ELEMS);
-    float* shared_b_warp = shared_a_warp + WARP_A_ELEMS;
+    // base indices for this thread block
+    float* shared_a_warp = shared_mem;
+    float* shared_b_warp = shared_a_warp + K * warps_m * PROB_A_ELEMS;
 
     const int32_t cd_idx[4] = {2 * lane + 0, 
                                2 * lane + 1, 
@@ -450,8 +463,8 @@ __global__ void matmul_improved_reduce(
                               ((lane % 4) + 4) * 16 + (8 + lane / 4)};
 
     auto do_cp_async = [&](int32_t block_k0, float* shared_a, float* shared_b) {
-        for (int32_t i = 0; i < 4; ++i) {
-            {
+        if (warp_j == 0) {
+            for (int32_t i = 0; i < 4; ++i) {
                 // A (16x8)
                 const int32_t linear_idx = a_idx[i];
                 const int32_t row = linear_idx / 8;
@@ -463,8 +476,10 @@ __global__ void matmul_improved_reduce(
                 if (!oob) {
                     cp_async_float_(&shared_a[linear_idx], &a[global_i * size_k + global_k]);
                 }
-            }
-            {
+            } 
+        }
+        if (warp_i == 0) {
+            for (int32_t i = 0; i < 4; ++i) {
                 // B (2 x (8x8))
                 const int32_t linear_idx = b_idx[i];
                 const int32_t row = linear_idx / 16;
@@ -536,34 +551,38 @@ __global__ void matmul_improved_reduce(
     const int32_t tiles_count = max(tiles_end - tiles_begin, 0);
 
     // load first K tiles
-    for (int32_t t = 0; t < K; ++t) {
-        int32_t k0 = (tiles_begin + t) * 8;
-        float* shared_ai = shared_a_warp + t * PROB_A_ELEMS;
-        float* shared_bi = shared_b_warp + t * PROB_B_ELEMS;
-        do_cp_async(k0, shared_ai, shared_bi);
-        async_commit_group();
+    if (warp_i == 0 || warp_j == 0) {
+        for (int32_t t = 0; t < K; ++t) {
+            const int32_t k0 = (tiles_begin + t) * 8;
+            float* shared_ai = shared_a_warp + t * (warps_m * PROB_A_ELEMS) + warp_i * PROB_A_ELEMS;
+            float* shared_bi = shared_b_warp + t * (warps_n * PROB_B_ELEMS) + warp_j * PROB_B_ELEMS;
+            do_cp_async(k0, shared_ai, shared_bi);
+            async_commit_group();
+        }
     }
 
     // do main computation for this K_BLOCK
     int32_t blocks_left = K;
     for (int32_t t = 0; t < tiles_count; ++t) {
-        int32_t s = t % K;
-        float* shared_ai = shared_a_warp + s * PROB_A_ELEMS;
-        float* shared_bi = shared_b_warp + s * PROB_B_ELEMS;
-
+        const int32_t s = t % K;
+        float* shared_ai = shared_a_warp + s * (warps_m * PROB_A_ELEMS) + warp_i * PROB_A_ELEMS;
+        float* shared_bi = shared_b_warp + s * (warps_n * PROB_B_ELEMS) + warp_j * PROB_B_ELEMS;
+      
         async_wait_pending_dynamic<K - 1>(blocks_left - 1);
-        __syncwarp();
-
+        __syncthreads();
         compute_slice(shared_ai, shared_bi);
+        __syncthreads();
 
         blocks_left -= 1;
 
         const int next_tile = t + K;
         if (next_tile < tiles_count) {
-            const int32_t next_k0 = (tiles_begin + next_tile) * 8;
-            do_cp_async(next_k0, shared_ai, shared_bi);
-            async_commit_group();
-            blocks_left += 1;
+            if (warp_i == 0 || warp_j == 0) {
+                const int32_t next_k0 = (tiles_begin + next_tile) * 8;
+                do_cp_async(next_k0, shared_ai, shared_bi);
+                async_commit_group();
+                blocks_left += 1;
+            }
         }
     }
 
@@ -595,7 +614,6 @@ size_t get_workspace_size(int32_t size_i, int32_t size_j, int32_t size_k) {
     const int32_t num_k_tiles = ceil_div(size_k, 8);
     const int32_t num_groups = ceil_div(num_k_tiles, K_BLOCK);
     return num_elements * num_groups * sizeof(float);
-    return 0;
 }
 
 void launch_matmul_tensor(
@@ -617,7 +635,7 @@ void launch_matmul_tensor(
     {
         dim3 block(32, num_warps, 1);
         dim3 grid(ceil_div(size_i, 16 * warps_m), ceil_div(size_j, 16 * warps_n), num_groups);
-        const int32_t shmem_size = (WARP_A_ELEMS + WARP_B_ELEMS) * num_warps * sizeof(float);
+        const int32_t shmem_size = K * (warps_m * PROB_A_ELEMS + warps_n * PROB_B_ELEMS) * sizeof(float);
         cudaFuncSetAttribute(
             matmul_improved_reduce,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
