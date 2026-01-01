@@ -354,6 +354,26 @@ void cp_async_float(float* smem_dst, const float* gmem_src, bool ignore_src) {
     );
 }
 
+template<int32_t MaxN>
+__device__ __forceinline__ void async_wait_pending_dynamic(int32_t n) {
+    if (n <= 0) {
+        async_wait_pending<0>();
+        return;
+    }
+    if (n >= MaxN) {
+        async_wait_pending<MaxN>();
+        return;
+    }
+    if constexpr (MaxN > 0) {
+        if (n == MaxN) {
+            async_wait_pending<MaxN>();
+        } else {
+            async_wait_pending_dynamic<MaxN - 1>(n);
+        }
+    }
+}
+
+
 /* TODO: your GPU kernels here... */
 
 __global__ void reduce_basic(
@@ -498,6 +518,7 @@ __global__ void matmul_improved_reduce(
         );
     };
 
+
     // load first K tiles
     for (int32_t t = 0; t < K; ++t) {
         int32_t k0 = t * 8;
@@ -507,24 +528,27 @@ __global__ void matmul_improved_reduce(
         async_commit_group();
     }
 
-    int32_t num_k_tiles = ceil_div(size_k, 8);
+    int32_t blocks_left = K;
 
+    int32_t num_k_tiles = ceil_div(size_k, 8);
     for (int32_t t = 0; t < num_k_tiles; ++t) {
         int32_t s = t % K;
 
-        async_wait_pending<K - 1>();
-
-        __syncthreads();
         float* shared_ai = shared_a_warp + s * PROB_A_ELEMS;
         float* shared_bi = shared_b_warp + s * PROB_B_ELEMS;
-        compute_slice(shared_ai, shared_bi);
+
+        async_wait_pending_dynamic<K - 1>(blocks_left - 1);
         __syncthreads();
 
-        const int t_next_K = t + K;
-        if (t_next_K < num_k_tiles) {
-            const int next_k0 = t_next_K * 8;
+        compute_slice(shared_ai, shared_bi);
+        blocks_left -= 1;
+
+        const int next_tile = t + K;
+        if (next_tile < num_k_tiles) {
+            const int32_t next_k0 = next_tile * 8;
             do_cp_async(next_k0, shared_ai, shared_bi);
             async_commit_group();
+            blocks_left += 1;
         }
     }
 
@@ -551,9 +575,10 @@ __global__ void matmul_improved_reduce(
 
 size_t get_workspace_size(int32_t size_i, int32_t size_j, int32_t size_k) {
     /* TODO: your CPU code here */
-    const int32_t num_elements = size_i * size_j;
-    const int32_t k_slices = ceil_div(size_k, 8);
-    return num_elements * k_slices * sizeof(float);
+    // const int32_t num_elements = size_i * size_j;
+    // const int32_t k_slices = ceil_div(size_k, 8);
+    // return num_elements * k_slices * sizeof(float);
+    return 0;
 }
 
 void launch_matmul_tensor(
@@ -974,11 +999,11 @@ int main(int argc, char **argv) {
 
 
     auto configs = std::vector<BenchmarkConfig>{
-        // {3072, 3072, 3072},
-        // {2048, 3072, 3072},
-        // {1024, 3072, 3072},
-        // {512, 3072, 3072},
-        // {256, 3072, 3072},
+        {3072, 3072, 3072},
+        {2048, 3072, 3072},
+        {1024, 3072, 3072},
+        {512, 3072, 3072},
+        {256, 3072, 3072},
         {128, 3072, 3072},
         {64, 3072, 3072},
         {32, 3072, 3072},
