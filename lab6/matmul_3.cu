@@ -523,6 +523,7 @@ __global__ void matmul_improved_reduce(
     const int32_t tiles_count = max(tiles_end - tiles_begin, 0);
 
     // load first K tiles
+    int32_t blocks_left = 0;
     if (warp_i == 0 || warp_j == 0) {
         for (int32_t t = 0; t < K; ++t) {
             const int32_t k0 = (tiles_begin + t) * 8;
@@ -531,10 +532,10 @@ __global__ void matmul_improved_reduce(
             do_cp_async(k0, shared_ai, shared_bi);
             async_commit_group();
         }
+        blocks_left = K;
     }
 
     // do main computation for this K_BLOCK
-    int32_t blocks_left = K;
     for (int32_t t = 0; t < tiles_count; ++t) {
         const int32_t s = t % K;
         float* shared_ai = shared_a_warp + s * (warps_m * PROB_A_ELEMS) + warp_i * PROB_A_ELEMS;
@@ -544,12 +545,12 @@ __global__ void matmul_improved_reduce(
         __syncthreads();
         compute_slice(shared_ai, shared_bi);
         __syncthreads();
+        
         blocks_left -= 1;
 
-        const int next_tile = t + K;
-        if (next_tile < tiles_count) {
+        if (t + K < tiles_count) {
             if (warp_i == 0 || warp_j == 0) {
-                const int32_t next_k0 = (tiles_begin + next_tile) * 8;
+                const int32_t next_k0 = (tiles_begin + (t + K)) * 8;
                 do_cp_async(next_k0, shared_ai, shared_bi);
                 async_commit_group();
                 blocks_left += 1;
