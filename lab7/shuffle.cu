@@ -24,6 +24,12 @@ __global__ void no_shuffle_kernel(data_type *src, clock_type *dst) {
     start_time = clock_cycle();
 
     // Your code goes here
+    mem[threadIdx.x] = val;
+    data_type sum = val;
+    for (int32_t idx = 0; idx < threadIdx.x; ++idx) {
+        sum += mem[idx];
+    }
+    mem[threadIdx.x] = sum;
 
     end_time = clock_cycle();
     __threadfence();
@@ -43,6 +49,13 @@ __global__ void shuffle_kernel(data_type *src, clock_type *dst) {
     start_time = clock_cycle();
 
     // Your code goes here
+    data_type sum;
+    for (int32_t idx = 1; idx < warp_size; idx = idx * 2) {
+        sum = __shfl_up_sync(0xFFFFFFFF, val, idx);
+        if ((int32_t)threadIdx.x - idx >= 0) {
+            val += sum;
+        }
+    }
 
     end_time = clock_cycle();
     __threadfence();
