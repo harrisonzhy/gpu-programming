@@ -48,9 +48,13 @@ void scan_cpu(size_t n, typename Op::Data const *x, typename Op::Data *out) {
 
 namespace scan_gpu {
 
-static constexpr int32_t T = 16;
+static constexpr int32_t T = 4;
 static constexpr int32_t W = 32 * T; // each warp does 32 * T elements
-static constexpr int32_t num_warps_per_block = 16;
+static constexpr int32_t num_warps_per_block = 32;
+static constexpr int32_t stage_stride = num_warps_per_block * 32;
+
+static constexpr int32_t num_prefetch_partial_reduce = 16;
+static constexpr int32_t num_prefetch = 1;
 
 __forceinline__ int32_t ceil_div(int32_t a, int32_t b) {
     return (a + b - 1) / b;
@@ -88,6 +92,25 @@ void cp_async4_(typename Op::Data* smem_dst, const typename Op::Data* gmem_src) 
     );
 }
 
+template<int32_t MaxN>
+__device__ __forceinline__ void async_wait_pending_dynamic(int32_t n) {
+    if (n <= 0) {
+        async_wait_pending<0>();
+        return;
+    }
+    if (n >= MaxN) {
+        async_wait_pending<MaxN>();
+        return;
+    }
+    if constexpr (MaxN > 0) {
+        if (n == MaxN) {
+            async_wait_pending<MaxN>();
+        } else {
+            async_wait_pending_dynamic<MaxN - 1>(n);
+        }
+    }
+}
+
 /* TODO: your GPU kernels here... */
 
 template <typename Op>
@@ -98,26 +121,28 @@ __global__ void partial_reduce(
 ) {
     using Data = typename Op::Data;
 
-    const int32_t lane = threadIdx.x; // 0..32
+    const int32_t lane = threadIdx.x;
     const int32_t warp_idx = threadIdx.y;
     const int32_t warp_idx0 = blockIdx.x * (num_warps_per_block * W) + warp_idx * W;
 
     extern __shared__ __align__(16) char shared_mem_[];
     Data* shared_mem = reinterpret_cast<Data*>(shared_mem_);
 
-    auto do_cp_async = [&](int32_t warp_offset /* 0..T-1 */) {
+    auto do_cp_async = [&](int32_t warp_offset /* 0..T-1 */, Data* shared_dst) {
         // per-warp copy
-        int32_t dst_idx = warp_idx * W + 32 * warp_offset;
+        int32_t dst_idx = warp_idx * 32;
         int32_t src_idx = warp_idx0 + 32 * warp_offset;
-        Data* dst_tile = shared_mem + dst_idx;
+        Data* dst_tile = shared_dst + dst_idx;
         const Data* src_tile = x + src_idx;
         bool bound_ok = (src_idx + lane * 4 + 3 < n);
         if (lane < 8) {
             if (bound_ok) {
                 cp_async4_<Op>(dst_tile + lane * 4, src_tile + lane * 4);
             } else {
-                for (int32_t idx = src_idx + lane * 4; idx < n; ++idx) {
-                    cp_async_<Op>(dst_tile + idx, src_tile + idx);
+                for (int32_t idx = 0; idx < 4; ++idx) {
+                    if (src_idx + lane * 4 + idx < n) {
+                        cp_async_<Op>(dst_tile + lane * 4 + idx, src_tile + lane * 4 + idx);
+                    }
                 }
             }
         }
@@ -125,8 +150,8 @@ __global__ void partial_reduce(
 
     Data reg[T];
 
-    auto do_shfl = [&](int32_t warp_offset, Data init_val) {
-        reg[warp_offset] = shared_mem[warp_idx * W + 32 * warp_offset + lane];
+    auto do_shfl = [&](int32_t warp_offset, Data init_val, const Data* shared_src) {
+        reg[warp_offset] = shared_src[warp_idx * 32 + lane];
         Data sum;
         for (int32_t idx = 1; idx < 32; idx = idx * 2) {
             sum = __shfl_up_sync(0xFFFFFFFF, reg[warp_offset], idx);
@@ -138,23 +163,165 @@ __global__ void partial_reduce(
         out[warp_idx0 + 32 * warp_offset + lane] = reg[warp_offset];
     };
 
-    for (int32_t t = 0; t < T; ++t) {
-        do_cp_async(t);
+    for (int32_t t = 0; t < num_prefetch_partial_reduce; ++t) {
+        do_cp_async(t, shared_mem + stage_stride * t);
         async_commit_group();
-        async_wait_pending<0>();
+    }
+
+    int32_t blocks_left = num_prefetch_partial_reduce;
+
+    for (int32_t t = 0; t < T; ++t) {
+        // async_wait_pending<0>();
+        async_wait_pending_dynamic<num_prefetch_partial_reduce - 1>(blocks_left - 1);
         __syncthreads();
         if (t > 0) {
             Data carry = __shfl_sync(0xFFFFFFFF, reg[t - 1], 31);
-            do_shfl(t, carry);
+            do_shfl(t, carry, shared_mem + stage_stride * (t % num_prefetch_partial_reduce));
         } else {
-            do_shfl(t, Op::identity());
+            do_shfl(t, Op::identity(), shared_mem + stage_stride * (t % num_prefetch_partial_reduce));
         }
+        blocks_left -= 1;
         __syncthreads();
+        const int32_t next = t + num_prefetch_partial_reduce;
+        if (next < T) {
+            do_cp_async(t + num_prefetch_partial_reduce, shared_mem + stage_stride * (next % num_prefetch_partial_reduce));
+            async_commit_group();
+            blocks_left += 1;
+        }
+    }
+}
+
+template <typename Op>
+__global__ void warp_fixup(
+    size_t n,
+    typename Op::Data *inter,
+    typename Op::Data *block_carries
+) {
+    using Data = typename Op::Data;
+
+    const int32_t lane = threadIdx.x; // 0..32
+    const int32_t warp_idx = threadIdx.y;
+    const int32_t warp_idx0 = blockIdx.x * (num_warps_per_block * W) + warp_idx * W;
+
+    extern __shared__ __align__(16) char shared_mem_[];
+    Data* shared_mem = reinterpret_cast<Data*>(shared_mem_);
+    Data* shared_mem_partials = shared_mem + (num_prefetch * stage_stride);
+ 
+    auto do_cp_async = [&](int32_t warp_offset /* 0..T-1 */, Data* shared_dst) {
+        // per-warp copy
+        int32_t dst_idx = warp_idx * 32;
+        int32_t src_idx = warp_idx0 + 32 * warp_offset;
+        Data* dst_tile = shared_dst + dst_idx;
+        const Data* src_tile = inter + src_idx;
+        bool bound_ok = (src_idx + lane * 4 + 3 < n);
+        if (lane < 8) {
+            if (bound_ok) {
+                cp_async4_<Op>(dst_tile + lane * 4, src_tile + lane * 4);
+            } else {
+                for (int32_t idx = 0; idx < 4; ++idx) {
+                    if (src_idx + lane * 4 + idx < n) {
+                        cp_async_<Op>(dst_tile + lane * 4 + idx, src_tile + lane * 4 + idx);
+                    }
+                }
+            }
+        }
+    };
+
+    auto fetch_last_partials = [&]() {
+        if (warp_idx == 0 && lane == 0) {
+            const int32_t block_base = blockIdx.x * (num_warps_per_block * W);
+            for (int32_t w = 0; w < num_warps_per_block; ++w) {
+                const int32_t warp_base = block_base + w * W;
+                const int32_t end = min(warp_base + W, (int32_t)n) - 1;
+                if (end >= warp_base) {
+                    cp_async_<Op>(shared_mem_partials + w, inter + end);
+                }
+            }
+        }
+    };
+
+    auto scan_shared_partials = [&]() {
+        if (warp_idx == 0) {
+            Data val = (lane < num_warps_per_block) ? shared_mem_partials[lane] : Op::identity();
+            Data sum;
+            for (int32_t idx = 1; idx < 32; idx = idx * 2) {
+                sum = __shfl_up_sync(0xFFFFFFFF, val, idx);
+                if (lane >= idx) {
+                    val = Op::combine(sum, val);
+                }
+            }
+            if (lane < num_warps_per_block) {
+                shared_mem_partials[lane] = val;
+            }
+        }
+    };
+
+    fetch_last_partials();
+    async_commit_group();
+    async_wait_pending<0>();
+    __syncthreads();
+
+    scan_shared_partials();
+
+    for (int32_t t = 0; t < num_prefetch; ++t) {
+        do_cp_async(t, shared_mem + stage_stride * (t % num_prefetch));
+        async_commit_group();
     }
 
-    if (lane == 0) {
-        for (int t = 0; t < T; ++t) {
-            printf("tile %d lane31 = %d\n", t, out[warp_idx0 + 32 * t + 31]);
+    int32_t blocks_left = num_prefetch;
+
+    const int32_t block_elems = num_warps_per_block * W;
+    const int32_t block_base  = blockIdx.x * block_elems;
+    const int32_t block_end   = min(block_base + block_elems, (int32_t)n) - 1;
+
+    for (int32_t t = 0; t < T; ++t) {
+        // async_wait_pending<0>();
+        async_wait_pending_dynamic<num_prefetch - 1>(blocks_left - 1);
+        __syncthreads();
+
+        const Data* stage = shared_mem + stage_stride * (t % num_prefetch);
+        Data val = stage[warp_idx * 32 + lane];
+        blocks_left -= 1;
+
+        __syncthreads();
+
+        if (t + num_prefetch < T) {
+            do_cp_async(t + num_prefetch, shared_mem + stage_stride * ((t + num_prefetch) % num_prefetch));
+            async_commit_group();
+            blocks_left += 1;
+        }
+
+        const int32_t idx = warp_idx0 + 32 * t + lane;
+        if (idx < n) {
+            Data carry = (warp_idx == 0) ? Op::identity() : shared_mem_partials[warp_idx - 1];
+            Data val_ = Op::combine(carry, val);
+            inter[idx] = val_;
+            // printf("inter[%d]: %d\n", idx, inter[idx]);
+
+            if (idx == block_end) {
+                block_carries[blockIdx.x] = val_;
+            }
+        }
+    }
+}
+
+template <typename Op>
+__global__ void block_fixup(
+    size_t n, 
+    const typename Op::Data* block_prefix, 
+    typename Op::Data* inter
+) {
+    using Data = typename Op::Data;
+    const int32_t block_elems = num_warps_per_block * W;
+
+    Data carry = (blockIdx.x == 0) ? Op::identity() : block_prefix[blockIdx.x - 1];
+
+    const int32_t base = blockIdx.x * block_elems;
+    const int32_t tid  = threadIdx.y * 32 + threadIdx.x;
+    for (int32_t i = tid; i < block_elems; i += blockDim.x * blockDim.y) {
+        const int32_t j = base + i;
+        if (j < n) {
+            inter[j] = Op::combine(carry, inter[j]);
         }
     }
 }
@@ -163,7 +330,7 @@ __global__ void partial_reduce(
 template <typename Op> size_t get_workspace_size(size_t n) {
     using Data = typename Op::Data;
     /* TODO: your CPU code here... */
-    return sizeof(Data) * n;
+    return 2 * sizeof(Data) * n; // factor of 2 accomodates block_carries matrix more than sufficiently
 }
 
 // 'launch_scan'
@@ -211,16 +378,40 @@ typename Op::Data *launch_scan(
     /* TODO: your CPU code here... */
 
     Data* out = reinterpret_cast<Data*>(workspace_);
+    const int32_t shmem_size_tiles = max(num_prefetch, num_prefetch_partial_reduce) * stage_stride /* (this is num_warps_per_block * 32) */ * sizeof(Data);
+
+    dim3 block(32, num_warps_per_block, 1);
+    const int32_t grid = ceil_div(n, num_warps_per_block * W);
     {
-        dim3 block(32, num_warps_per_block, 1);
-        const int32_t grid = ceil_div(n, num_warps_per_block * W);
-        const int32_t shmem_size = num_warps_per_block * W * sizeof(Data);
         cudaFuncSetAttribute(
             partial_reduce<Op>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
+            shmem_size_tiles
+        );
+        partial_reduce<Op><<<grid, block, shmem_size_tiles>>>(n, x, out);
+    }
+    
+    Data* block_carries = reinterpret_cast<Data*>(out) + n;
+    const int32_t shmem_size_partial = num_warps_per_block * sizeof(Data);
+    {
+        const int32_t shmem_size = shmem_size_partial + shmem_size_tiles;
+        cudaFuncSetAttribute(
+            warp_fixup<Op>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
             shmem_size
         );
-        partial_reduce<Op><<<grid, block, shmem_size>>>(n, x, out);
+        warp_fixup<Op><<<grid, block, shmem_size>>>(n, out, block_carries);
+    }
+    {
+        std::vector<Data> h(grid);
+        cudaMemcpy(h.data(), block_carries, grid * sizeof(Data), cudaMemcpyDeviceToHost);
+        for (int32_t idx = 1; idx < grid; ++idx) {
+            h[idx] = Op::combine(h[idx - 1], h[idx]);
+        }
+        cudaMemcpy(block_carries, h.data(), grid * sizeof(Data), cudaMemcpyHostToDevice);
+    }
+    {
+        block_fixup<Op><<<grid, block>>>(n, block_carries, out);
     }
 
     return out; // replace with an appropriate pointer
