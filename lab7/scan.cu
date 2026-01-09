@@ -116,7 +116,7 @@ template <typename Op>
 __global__ void partial_reduce(
     size_t n,
     typename Op::Data *x,
-    typename Op::Data *out
+    typename Op::Data *inter
 ) {
     using Data = typename Op::Data;
 
@@ -159,7 +159,7 @@ __global__ void partial_reduce(
             }
         }
         reg[warp_offset] = Op::combine(init_val, reg[warp_offset]);
-        out[warp_idx0 + 32 * warp_offset + lane] = reg[warp_offset];
+        inter[warp_idx0 + 32 * warp_offset + lane] = reg[warp_offset];
     };
 
     for (int32_t t = 0; t < num_prefetch_warmup; ++t) {
@@ -181,7 +181,7 @@ __global__ void partial_reduce(
 template <typename Op>
 __global__ void warp_fixup(
     size_t n,
-    typename Op::Data *inter,
+    const typename Op::Data *inter,
     typename Op::Data *block_carries
 ) {
     using Data = typename Op::Data;
@@ -192,7 +192,84 @@ __global__ void warp_fixup(
 
     extern __shared__ __align__(16) char shared_mem_[];
     Data* shared_mem = reinterpret_cast<Data*>(shared_mem_);
+ 
+    auto do_cp_async = [&](int32_t warp_offset /* 0..T-1 */, Data* shared_dst) {
+        // per-warp copy
+        int32_t dst_idx = warp_idx * 32;
+        int32_t src_idx = warp_idx0 + 32 * warp_offset;
+        Data* dst_tile = shared_dst + dst_idx;
+        const Data* src_tile = inter + src_idx;
+        bool bound_ok = (src_idx + lane * 4 + 3 < n);
+        if (lane < 8) {
+            if (bound_ok) {
+                cp_async4_<Op>(dst_tile + lane * 4, src_tile + lane * 4);
+            } else {
+                for (int32_t idx = 0; idx < 4; ++idx) {
+                    if (src_idx + lane * 4 + idx < n) {
+                        cp_async_<Op>(dst_tile + lane * 4 + idx, src_tile + lane * 4 + idx);
+                    }
+                }
+            }
+        }
+    };
+
+    auto fetch_last_partials = [&]() {
+        if (warp_idx == 0 && lane == 0) {
+            const int32_t block_base = blockIdx.x * (num_warps_per_block * W);
+            for (int32_t w = 0; w < num_warps_per_block; ++w) {
+                const int32_t warp_base = block_base + w * W;
+                const int32_t end = min(warp_base + W, (int32_t)n) - 1;
+                if (end >= warp_base) {
+                    cp_async_<Op>(shared_mem + w, inter + end);
+                }
+            }
+        }
+    };
+
+    auto scan_shared_partials = [&]() {
+        if (warp_idx == 0) {
+            Data val = (lane < num_warps_per_block) ? shared_mem[lane] : Op::identity();
+            Data sum;
+            for (int32_t idx = 1; idx < 32; idx = idx * 2) {
+                sum = __shfl_up_sync(0xFFFFFFFF, val, idx);
+                if (lane >= idx) {
+                    val = Op::combine(sum, val);
+                }
+            }
+            if (lane < num_warps_per_block) {
+                shared_mem[lane] = val;
+            }
+        }
+    };
+
+    fetch_last_partials();
+    async_commit_group();
+    async_wait_pending<0>();
+    __syncwarp();
+
+    scan_shared_partials();
+
+    if (warp_idx == 0 && lane == 0) {
+        block_carries[blockIdx.x] = shared_mem[num_warps_per_block - 1];
+    }
+}
+
+template <typename Op>
+__global__ void finalize(
+    size_t n,
+    typename Op::Data *inter,
+    const typename Op::Data *block_carries
+) {
+    using Data = typename Op::Data;
+
+    const int32_t lane = threadIdx.x; // 0..32
+    const int32_t warp_idx = threadIdx.y;
+    const int32_t warp_idx0 = blockIdx.x * (num_warps_per_block * W) + warp_idx * W;
+
+    extern __shared__ __align__(16) char shared_mem_[];
+    Data* shared_mem = reinterpret_cast<Data*>(shared_mem_);
     Data* shared_mem_partials = shared_mem + T * stage_stride;
+    Data* shared_mem_block_carries = shared_mem_partials + num_warps_per_block;
  
     auto do_cp_async = [&](int32_t warp_offset /* 0..T-1 */, Data* shared_dst) {
         // per-warp copy
@@ -243,17 +320,20 @@ __global__ void warp_fixup(
         }
     };
 
-    const int32_t block_elems = num_warps_per_block * W;
-    const int32_t block_base = blockIdx.x * block_elems;
-    const int32_t block_end = min(block_base + block_elems, (int32_t)n) - 1;
+    if (blockIdx.x > 0 && warp_idx == 0) {
+        cp_async_<Op>(shared_mem_block_carries, block_carries + blockIdx.x - 1);
+        async_commit_group();
+    }
 
     fetch_last_partials();
     async_commit_group();
     async_wait_pending<0>();
-    __syncthreads();
+    __syncwarp();
 
     scan_shared_partials();
     __syncthreads();
+
+    const Data block_carry = (blockIdx.x == 0) ? Op::identity() : shared_mem_block_carries[0];
 
     // prefetch t = 0
     do_cp_async(0, shared_mem + stage_stride * 0);
@@ -265,7 +345,7 @@ __global__ void warp_fixup(
 
         const int32_t next = t + 1;
         if (next < T) {
-            do_cp_async(next, shared_mem + stage_stride * next);
+            do_cp_async(next, shared_mem + stage_stride * (next % num_prefetch_warmup));
             async_commit_group();
         }
 
@@ -278,31 +358,7 @@ __global__ void warp_fixup(
         if (idx < n) {
             Data carry = (warp_idx == 0) ? Op::identity() : shared_mem_partials[warp_idx - 1];
             val = Op::combine(carry, val);
-            inter[idx] = val;
-            if (idx == block_end) {
-                block_carries[blockIdx.x] = val;
-            }
-        }
-    }
-}
-
-template <typename Op>
-__global__ void block_fixup(
-    size_t n, 
-    const typename Op::Data* block_prefix, 
-    typename Op::Data* inter
-) {
-    using Data = typename Op::Data;
-    const int32_t block_elems = num_warps_per_block * W;
-
-    Data carry = (blockIdx.x == 0) ? Op::identity() : block_prefix[blockIdx.x - 1];
-
-    const int32_t base = blockIdx.x * block_elems;
-    const int32_t tid  = threadIdx.y * 32 + threadIdx.x;
-    for (int32_t i = tid; i < block_elems; i += blockDim.x * blockDim.y) {
-        const int32_t j = base + i;
-        if (j < n) {
-            inter[j] = Op::combine(carry, inter[j]);
+            inter[idx] = Op::combine(val, block_carry);
         }
     }
 }
@@ -311,7 +367,8 @@ __global__ void block_fixup(
 template <typename Op> size_t get_workspace_size(size_t n) {
     using Data = typename Op::Data;
     /* TODO: your CPU code here... */
-    return 2 * sizeof(Data) * n; // factor of 2 accomodates block_carries matrix more than sufficiently
+    // note: factor of 2 accomodates block_carries matrix sufficiently
+    return 2 * sizeof(Data) * n;
 }
 
 // 'launch_scan'
@@ -375,7 +432,7 @@ typename Op::Data *launch_scan(
     Data* block_carries = reinterpret_cast<Data*>(out) + n;
     const int32_t shmem_size_partial = num_warps_per_block * sizeof(Data);
     {
-        const int32_t shmem_size = shmem_size_partial + shmem_size_tiles;
+        const int32_t shmem_size = shmem_size_partial;
         cudaFuncSetAttribute(
             warp_fixup<Op>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -391,8 +448,15 @@ typename Op::Data *launch_scan(
         }
         cudaMemcpy(block_carries, h.data(), grid * sizeof(Data), cudaMemcpyHostToDevice);
     }
+    const int32_t shmem_size_carry = 1 * sizeof(Data);
     {
-        block_fixup<Op><<<grid, block>>>(n, block_carries, out);
+        const int32_t shmem_size = shmem_size_tiles + shmem_size_partial + shmem_size_carry;
+        cudaFuncSetAttribute(
+            finalize<Op>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            shmem_size
+        );
+        finalize<Op><<<grid, block, shmem_size>>>(n, out, block_carries);
     }
 
     return out; // replace with an appropriate pointer
