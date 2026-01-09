@@ -50,10 +50,11 @@ namespace scan_gpu {
 
 static constexpr int32_t T = 4;
 static constexpr int32_t W = 32 * T; // each warp does 32 * T elements
+
 static constexpr int32_t num_warps_per_block = 32;
 static constexpr int32_t stage_stride = num_warps_per_block * 32;
 
-static constexpr int32_t num_prefetch_warmup = 16;
+static constexpr int32_t num_warmup = 16;
 
 __forceinline__ int32_t ceil_div(int32_t a, int32_t b) {
     return (a + b - 1) / b;
@@ -162,18 +163,18 @@ __global__ void partial_reduce(
         inter[warp_idx0 + 32 * warp_offset + lane] = reg[warp_offset];
     };
 
-    for (int32_t t = 0; t < num_prefetch_warmup; ++t) {
-        do_cp_async(t, shared_mem + stage_stride * (t % num_prefetch_warmup));
+    for (int32_t t = 0; t < num_warmup; ++t) {
+        do_cp_async(t, shared_mem + stage_stride * t);
         async_commit_group();
     }
-    async_wait_pending<0>();
+    async_wait_pending<num_warmup - T + 1>();
 
     for (int32_t t = 0; t < T; ++t) {
-        if (t > 0) {
-            Data carry = __shfl_sync(0xFFFFFFFF, reg[t - 1], 31);
-            do_shfl(t, carry, shared_mem + stage_stride * (t % num_prefetch_warmup));
+        if (t == 0) {
+            do_shfl(t, Op::identity(), shared_mem + stage_stride * t);
         } else {
-            do_shfl(t, Op::identity(), shared_mem + stage_stride * (t % num_prefetch_warmup));
+            Data carry = __shfl_sync(0xFFFFFFFF, reg[t - 1], 31);
+            do_shfl(t, carry, shared_mem + stage_stride * t);
         }
     }
 }
@@ -245,7 +246,6 @@ __global__ void warp_fixup(
     fetch_last_partials();
     async_commit_group();
     async_wait_pending<0>();
-    __syncwarp();
 
     scan_shared_partials();
 
@@ -292,13 +292,13 @@ __global__ void finalize(
     };
 
     auto fetch_last_partials = [&]() {
-        if (warp_idx == 0 && lane == 0) {
+        if (warp_idx == 0) {
             const int32_t block_base = blockIdx.x * (num_warps_per_block * W);
-            for (int32_t w = 0; w < num_warps_per_block; ++w) {
-                const int32_t warp_base = block_base + w * W;
+            if (lane < num_warps_per_block) {
+                const int32_t warp_base = block_base + lane * W;
                 const int32_t end = min(warp_base + W, (int32_t)n) - 1;
                 if (end >= warp_base) {
-                    cp_async_<Op>(shared_mem_partials + w, inter + end);
+                    cp_async_<Op>(shared_mem_partials + lane, inter + end);
                 }
             }
         }
@@ -328,24 +328,26 @@ __global__ void finalize(
     fetch_last_partials();
     async_commit_group();
     async_wait_pending<0>();
-    __syncwarp();
 
     scan_shared_partials();
     __syncthreads();
 
     const Data block_carry = (blockIdx.x == 0) ? Op::identity() : shared_mem_block_carries[0];
-
-    // prefetch t = 0
-    do_cp_async(0, shared_mem + stage_stride * 0);
-    async_commit_group();
+    const Data partial_reg = shared_mem_partials[warp_idx - 1];
 
     for (int32_t t = 0; t < T; ++t) {
+        if (t == 0) {
+            // initiate prefetch for t = 0
+            do_cp_async(t, shared_mem + stage_stride * t);
+            async_commit_group();
+        }
+
         async_wait_pending<0>();
         __syncthreads();
 
         const int32_t next = t + 1;
         if (next < T) {
-            do_cp_async(next, shared_mem + stage_stride * (next % num_prefetch_warmup));
+            do_cp_async(next, shared_mem + stage_stride * next);
             async_commit_group();
         }
 
@@ -356,7 +358,7 @@ __global__ void finalize(
 
         const int32_t idx = warp_idx0 + 32 * t + lane;
         if (idx < n) {
-            Data carry = (warp_idx == 0) ? Op::identity() : shared_mem_partials[warp_idx - 1];
+            Data carry = (warp_idx == 0) ? Op::identity() : partial_reg;
             val = Op::combine(carry, val);
             inter[idx] = Op::combine(val, block_carry);
         }
@@ -416,9 +418,9 @@ typename Op::Data *launch_scan(
     /* TODO: your CPU code here... */
 
     Data* out = reinterpret_cast<Data*>(workspace_);
-    const int32_t shmem_size_tiles = max(T, num_prefetch_warmup) * stage_stride /* (this is num_warps_per_block * 32) */ * sizeof(Data);
+    const int32_t shmem_size_tiles = max(T, num_warmup) * stage_stride /* (this is num_warps_per_block * 32) */ * sizeof(Data);
 
-    dim3 block(32, num_warps_per_block, 1);
+    const dim3 block(32, num_warps_per_block, 1);
     const int32_t grid = ceil_div(n, num_warps_per_block * W);
     {
         cudaFuncSetAttribute(
@@ -441,12 +443,12 @@ typename Op::Data *launch_scan(
         warp_fixup<Op><<<grid, block, shmem_size>>>(n, out, block_carries);
     }
     {
-        std::vector<Data> h(grid);
-        cudaMemcpy(h.data(), block_carries, grid * sizeof(Data), cudaMemcpyDeviceToHost);
+        std::vector<Data> block_carries_(grid);
+        cudaMemcpy(block_carries_.data(), block_carries, grid * sizeof(Data), cudaMemcpyDeviceToHost);
         for (int32_t idx = 1; idx < grid; ++idx) {
-            h[idx] = Op::combine(h[idx - 1], h[idx]);
+            block_carries_[idx] = Op::combine(block_carries_[idx - 1], block_carries_[idx]);
         }
-        cudaMemcpy(block_carries, h.data(), grid * sizeof(Data), cudaMemcpyHostToDevice);
+        cudaMemcpy(block_carries, block_carries_.data(), grid * sizeof(Data), cudaMemcpyHostToDevice);
     }
     const int32_t shmem_size_carry = 1 * sizeof(Data);
     {
