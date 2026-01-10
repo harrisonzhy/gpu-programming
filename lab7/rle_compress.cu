@@ -66,6 +66,10 @@ void rle_compress_cpu(
 ////////////////////////////////////////////////////////////////////////////////
 // Optimized GPU Implementation
 
+__forceinline__ int32_t ceil_div(int32_t a, int32_t b) {
+    return (a + b - 1) / b;
+}
+
 namespace rle_gpu {
 
 namespace scan_gpu {
@@ -78,10 +82,6 @@ static constexpr int32_t stage_stride = num_warps_per_block * 32;
 
 static constexpr int32_t num_warmup = 16;
 
-__forceinline__ int32_t ceil_div(int32_t a, int32_t b) {
-    return (a + b - 1) / b;
-}
-
 __device__ __forceinline__ void async_commit_group() {
     asm volatile("cp.async.commit_group;\n" ::);
 }
@@ -92,7 +92,7 @@ template <int N> __device__ __forceinline__ void async_wait_pending() {
 
 template<typename Op>
 __device__ __forceinline__ 
-void cp_async_(typename Op::Data* smem_dst, const typename Op::Data* gmem_src) {
+void cp_async_(void* smem_dst, const void* gmem_src) {
     unsigned smem_addr = __cvta_generic_to_shared(smem_dst);
     unsigned long long gmem_addr = reinterpret_cast<unsigned long long>(gmem_src);
     asm volatile(
@@ -104,7 +104,7 @@ void cp_async_(typename Op::Data* smem_dst, const typename Op::Data* gmem_src) {
 
 template<typename Op>
 __device__ __forceinline__ 
-void cp_async4_(typename Op::Data* smem_dst, const typename Op::Data* gmem_src) {
+void cp_async4_(void* smem_dst, const void* gmem_src) {
     unsigned smem_addr = __cvta_generic_to_shared(smem_dst);
     unsigned long long gmem_addr = reinterpret_cast<unsigned long long>(gmem_src);
     asm volatile(
@@ -138,7 +138,7 @@ __device__ __forceinline__ void async_wait_pending_dynamic(int32_t n) {
 template <typename Op>
 __global__ void partial_reduce(
     size_t n,
-    typename Op::Data *x,
+    const char *x, /* note: always aligned to >= 256 bytes per CUDA standard */
     typename Op::Data *inter
 ) {
     using Data = typename Op::Data;
@@ -148,23 +148,25 @@ __global__ void partial_reduce(
     const int32_t warp_idx0 = blockIdx.x * (num_warps_per_block * W) + warp_idx * W;
 
     extern __shared__ __align__(16) char shared_mem_[];
-    Data* shared_mem = reinterpret_cast<Data*>(shared_mem_);
+    char* shared_mem = reinterpret_cast<char*>(shared_mem_);
 
-    auto do_cp_async = [&](int32_t warp_offset /* 0..T-1 */, Data* shared_dst) { 
+    auto do_cp_async = [&](int32_t warp_offset /* 0..T-1 */, char* shared_dst) { 
+        // TODO: use cp_async4_
         if (lane < 8) {
             // per-warp copy
             const int32_t dst_idx = warp_idx * 32;
             const int32_t src_idx = warp_idx0 + 32 * warp_offset;
-            Data* dst_tile = shared_dst + dst_idx;
-            const Data* src_tile = x + src_idx;
+            char* dst_tile = shared_dst + dst_idx;
+            const char* src_tile = x + src_idx;
             const bool bound_ok = (src_idx + lane * 4 + 3 < n);
 
             if (bound_ok) {
-                cp_async4_<Op>(dst_tile + lane * 4, src_tile + lane * 4);
+                cp_async_<Op>(dst_tile + lane * 4, src_tile + lane * 4);
             } else {
                 for (int32_t idx = 0; idx < 4; ++idx) {
-                    if (src_idx + lane * 4 + idx < n) {
-                        cp_async_<Op>(dst_tile + lane * 4 + idx, src_tile + lane * 4 + idx);
+                    const int32_t lane_idx = lane * 4 + idx;
+                    if (src_idx + lane_idx < n) {
+                        dst_tile[lane_idx] = src_tile[lane_idx];
                     }
                 }
             }
@@ -172,8 +174,11 @@ __global__ void partial_reduce(
     };
 
     Data reg[T];
-    auto do_shfl = [&](int32_t warp_offset, Data init_val, const Data* shared_src) {
-        reg[warp_offset] = shared_src[warp_idx * 32 + lane];
+    auto do_shfl = [&](int32_t warp_offset, Data init_val, const char* shared_src) {
+        // reg[warp_offset] = shared_src[warp_idx * 32 + lane];
+        const int32_t lane_idx = warp_idx * 32 + lane;
+        reg[warp_offset] = (lane_idx == 0) ? 1 : (uint32_t)(shared_src[lane_idx] != shared_src[lane_idx - 1]);
+        
         Data sum;
         for (int32_t idx = 1; idx < 32; idx = idx * 2) {
             sum = __shfl_up_sync(0xFFFFFFFF, reg[warp_offset], idx);
@@ -398,7 +403,7 @@ template <typename Op> size_t get_workspace_size(size_t n) {
 template <typename Op>
 typename Op::Data *launch_scan(
     size_t n,
-    typename Op::Data *x, // pointer to GPU memory
+    char *x, // pointer to GPU memory
     void *workspace_       // pointer to GPU memory
 ) {
     using Data = typename Op::Data;
@@ -488,13 +493,19 @@ size_t get_workspace_size(uint32_t raw_count) {
 //
 uint32_t launch_rle_compress(
     uint32_t raw_count,
-    char const *raw,             // pointer to GPU buffer
+    char *raw,             // pointer to GPU buffer
     void *workspace,             // pointer to GPU buffer
     char *compressed_data,       // pointer to GPU buffer
     uint32_t *compressed_lengths // pointer to GPU buffer
 ) {
     /* TODO: your CPU code here... */
-    uint32_t compressed_count = 0;
+    using Data = SumOp::Data;
+
+    uint32_t* launch_out_gpu = scan_gpu::launch_scan<SumOp>(raw_count, raw, workspace);
+    CUDA_CHECK(
+        cudaMemcpy(compressed_lengths, launch_out_gpu, raw_count * sizeof(Data), cudaMemcpyDeviceToDevice));
+
+    uint32_t compressed_count = raw_count;
     return compressed_count;
 }
 
