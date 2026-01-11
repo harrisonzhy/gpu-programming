@@ -114,7 +114,7 @@ __device__ __forceinline__ void async_wait_pending_dynamic(int32_t n) {
 template <typename Op>
 __global__ void partial_reduce(
     size_t n,
-    typename Op::Data *x,
+    const typename Op::Data *x,
     typename Op::Data *inter
 ) {
     using Data = typename Op::Data;
@@ -158,7 +158,10 @@ __global__ void partial_reduce(
             }
         }
         reg[warp_offset] = Op::combine(init_val, reg[warp_offset]);
-        inter[warp_idx0 + 32 * warp_offset + lane] = reg[warp_offset];
+        const int32_t global_idx = warp_idx0 + 32 * warp_offset + lane;
+        if (global_idx < n) {
+            inter[global_idx] = reg[warp_offset];
+        }
     };
 
     for (int32_t t = 0; t < T / 4; ++t) {
@@ -378,7 +381,7 @@ template <typename Op> size_t get_workspace_size(size_t n) {
 template <typename Op>
 typename Op::Data *launch_scan(
     size_t n,
-    typename Op::Data *x, // pointer to GPU memory
+    const typename Op::Data *x, // pointer to GPU memory
     void *workspace_       // pointer to GPU memory
 ) {
     using Data = typename Op::Data;
@@ -671,6 +674,16 @@ void run_tests(std::vector<uint32_t> const &sizes, GenData &&gen_data) {
 
 int main(int argc, char const *const *argv) {
     auto correctness_sizes = std::vector<uint32_t>{
+        10,
+        6,
+        92,
+        79,
+        774,
+        766,
+        786702,
+        749585,
+        12585539,
+
         16,
         10,
         128,
