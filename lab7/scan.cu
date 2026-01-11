@@ -128,7 +128,7 @@ __global__ void partial_reduce(
 
     auto do_cp_async = [&](int32_t warp_offset /* 0..T-1 */, Data* shared_dst) { 
         // per-warp copy
-        const int32_t dst_idx = warp_idx * 128 * (T / 4) + 128 * warp_offset;
+        const int32_t dst_idx = warp_idx * W + 128 * warp_offset;
         const int32_t src_idx = warp_idx0 + 128 * warp_offset;
         
         Data* dst_tile = shared_dst + dst_idx;
@@ -168,7 +168,7 @@ __global__ void partial_reduce(
     async_wait_pending<0>();
 
     for (int32_t t = 0; t < T; ++t) {
-        Data* shared_mem_tile = shared_mem + warp_idx * (128 * (T / 4)) + (t / 4) * 128 + (t % 4) * 32;
+        Data* shared_mem_tile = shared_mem + warp_idx * W + t * 32;
         if (t == 0) {
             do_shfl(t, Op::identity(), shared_mem_tile);
         } else {
@@ -313,7 +313,7 @@ __global__ void finalize(
     const Data block_carry = (blockIdx.x == 0) ? Op::identity() : shared_mem_block_carries[0];
     const Data partial_reg = (warp_idx == 0) ? Op::identity() : shared_mem_partials[warp_idx - 1];
 
-    for (int32_t t = 0; t < (T / 4); ++t) {
+    for (int32_t t = 0; t < T / 4; ++t) {
         do_cp_async(t, shared_mem);
         async_commit_group();
     }
