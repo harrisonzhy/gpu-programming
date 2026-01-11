@@ -127,9 +127,8 @@ namespace scan_gpu_indicator {
 
 static constexpr int32_t T = 4;
 static constexpr int32_t W = 32 * T; // each warp does 32 * T elements
-
 static constexpr int32_t num_warps_per_block = 32;
-static constexpr int32_t stage_stride = num_warps_per_block * 32;
+static constexpr int32_t block_stride = num_warps_per_block * 32;
 
 static constexpr int32_t num_warmup = 16;
 
@@ -196,10 +195,10 @@ __global__ void partial_reduce(
                     prev = shared_src[lane_idx - 1];
                 } else {
                     if (warp_offset > 0) {
-                        const char* prev_tile = shared_mem + stage_stride * (warp_offset - 1);
+                        const char* prev_tile = shared_mem + block_stride * (warp_offset - 1);
                         prev = prev_tile[warp_idx * 32 + 31];
                     } else if (warp_idx > 0) {
-                        const char* prev_warp_last_tile = shared_mem + stage_stride * (T - 1);
+                        const char* prev_warp_last_tile = shared_mem + block_stride * (T - 1);
                         prev = prev_warp_last_tile[(warp_idx - 1) * 32 + 31];
                         // prev = shared_src[lane_idx - 1];
                     } else {
@@ -225,17 +224,17 @@ __global__ void partial_reduce(
     };
 
     for (int32_t t = 0; t < num_warmup; ++t) {
-        do_cp_async(t, shared_mem + stage_stride * t);
+        do_cp_async(t, shared_mem + block_stride * t);
         async_commit_group();
     }
     async_wait_pending<num_warmup - T + 1>();
 
     for (int32_t t = 0; t < T; ++t) {
         if (t == 0) {
-            do_shfl(t, Op::identity(), shared_mem + stage_stride * t);
+            do_shfl(t, Op::identity(), shared_mem + block_stride * t);
         } else {
             Data carry = __shfl_sync(0xFFFFFFFF, reg[t - 1], 31);
-            do_shfl(t, carry, shared_mem + stage_stride * t);
+            do_shfl(t, carry, shared_mem + block_stride * t);
         }
     }
 }
@@ -329,7 +328,7 @@ __global__ void finalize(
 
     extern __shared__ __align__(16) char shared_mem_[];
     Data* shared_mem = reinterpret_cast<Data*>(shared_mem_);
-    Data* shared_mem_partials = shared_mem + T * stage_stride;
+    Data* shared_mem_partials = shared_mem + T * block_stride;
     Data* shared_mem_block_carries = shared_mem_partials + num_warps_per_block;
  
     auto do_cp_async = [&](int32_t warp_offset /* 0..T-1 */, Data* shared_dst) {
@@ -399,7 +398,7 @@ __global__ void finalize(
     for (int32_t t = 0; t < T; ++t) {
         if (t == 0) {
             // initiate prefetch for t = 0
-            do_cp_async(t, shared_mem + stage_stride * t);
+            do_cp_async(t, shared_mem + block_stride * t);
             async_commit_group();
         }
 
@@ -408,11 +407,11 @@ __global__ void finalize(
 
         const int32_t next = t + 1;
         if (next < T) {
-            do_cp_async(next, shared_mem + stage_stride * next);
+            do_cp_async(next, shared_mem + block_stride * next);
             async_commit_group();
         }
 
-        const Data* stage = shared_mem + stage_stride * t;
+        const Data* stage = shared_mem + block_stride * t;
         Data val = stage[warp_idx * 32 + lane];
 
         __syncthreads();
@@ -444,7 +443,7 @@ typename Op::Data *launch_scan(
     /* TODO: your CPU code here... */
 
     Data* out = reinterpret_cast<Data*>(workspace_);
-    const int32_t shmem_size_tiles = max(T, num_warmup) * stage_stride /* (this is num_warps_per_block * 32) */ * sizeof(Data);
+    const int32_t shmem_size_tiles = max(T, num_warmup) * block_stride /* (this is num_warps_per_block * 32) */ * sizeof(Data);
 
     const dim3 block(32, num_warps_per_block, 1);
     const int32_t grid = ceil_div(n, num_warps_per_block * W);
@@ -494,10 +493,9 @@ typename Op::Data *launch_scan(
 
 namespace scan_gpu_normal {
 
-static constexpr int32_t T = 8;
+static constexpr int32_t T = 4;
 static constexpr int32_t W = 32 * T; // each warp does 32 * T elements
-
-static constexpr int32_t num_warps_per_block = 32;
+static constexpr int32_t num_warps_per_block = 16;
 static constexpr int32_t block_stride = num_warps_per_block * 32;
 
 template <typename Op>
@@ -742,7 +740,7 @@ typename Op::Data *launch_scan(
     /* TODO: your CPU code here... */
 
     Data* out = reinterpret_cast<Data*>(workspace_);
-    const int32_t shmem_size_tiles = T * block_stride /* (this is num_warps_per_block * 32) */ * sizeof(Data);
+    const int32_t shmem_size_tiles = T * block_stride * sizeof(Data);
 
     const dim3 block(32, num_warps_per_block, 1);
     const int32_t grid = ceil_div(n, num_warps_per_block * W);
@@ -869,6 +867,28 @@ __global__ void accum_counts(
     }
 }
 
+static constexpr int32_t T_sparse = 24;
+
+__global__ void sparse_memcpy(
+    const uint32_t* sparse_indices,
+    int32_t sparse_count,
+    const char* src,
+    char* dst
+) {
+    const int32_t idx_T = (blockIdx.x * blockDim.x + threadIdx.x) * T_sparse;
+    if (idx_T == 0) {
+        dst[0] = src[0];
+    }
+
+    for (int32_t idx_ = 0; idx_ < T_sparse; ++idx_) {
+        const int32_t idx = idx_T + idx_;
+        if (idx < sparse_count) {
+            const uint32_t sparse_idx = sparse_indices[idx] - 1;
+            dst[idx] = src[sparse_idx];
+        }
+    }
+}
+
 // Returns desired size of scratch buffer in bytes.
 size_t get_workspace_size(uint32_t raw_count) {
     /* TODO: your CPU code here... */
@@ -923,8 +943,6 @@ uint32_t launch_rle_compress(
         cudaMemcpy(&compressed_count, ind_scan_results + (raw_count - 1), sizeof(Data), cudaMemcpyDeviceToHost);
     }
     {
-        cudaMemset(compressed_lengths, 0, raw_count * sizeof(uint32_t));
-
         const dim3 block(32, num_warps_per_block, 1);
         const int32_t grid = ceil_div(raw_count, num_warps_per_block * W);
         const int32_t shmem_size = 2 * (num_warps_per_block * W) * sizeof(Data);
@@ -941,7 +959,7 @@ uint32_t launch_rle_compress(
             exit(1);
         }
     }
-    Data* cc_scan_results;
+    uint32_t* cc_scan_results;
     {
         void* cc_workspace_ = reinterpret_cast<uint8_t*>(workspace) + scan_gpu_indicator::get_workspace_size<SumOp>(raw_count);
         void* cc_workspace = reinterpret_cast<uint8_t*>((reinterpret_cast<uintptr_t>(cc_workspace_) + 15) & ~15);
@@ -953,7 +971,18 @@ uint32_t launch_rle_compress(
             exit(1);
         }
     }
+    {
+        static constexpr int32_t num_warps_per_block_ = 16;
+        const dim3 block(32, num_warps_per_block_, 1);
+        const int32_t grid = ceil_div(raw_count, num_warps_per_block_ * T_sparse);
+        sparse_memcpy<<<grid, block>>>(cc_scan_results, compressed_count, raw, compressed_data);
 
+        cudaError_t e = cudaGetLastError();
+        if (e != cudaSuccess) {
+            printf("Launch accum error: %s\n", cudaGetErrorString(e));
+            exit(1);
+        }
+    }
     return compressed_count;
 }
 
@@ -1029,6 +1058,7 @@ Results run_config(Mode mode, std::vector<char> const &raw) {
         workspace,
         compressed_data_gpu,
         compressed_lengths_gpu);
+    // printf("count: %u\n", compressed_count);
     std::vector<char> compressed_data(compressed_count);
     std::vector<uint32_t> compressed_lengths(compressed_count);
     CUDA_CHECK(cudaMemcpy(
@@ -1059,17 +1089,17 @@ Results run_config(Mode mode, std::vector<char> const &raw) {
     }
     if (correct) {
         for (size_t i = 0; i < compressed_data_expected.size(); i++) {
-            // if (compressed_data[i] != compressed_data_expected[i]) {
-            //     printf("Mismatch in compressed data at index %zu:\n", i);
-            //     printf(
-            //         "  Expected: 0x%02x\n",
-            //         static_cast<unsigned char>(compressed_data_expected[i]));
-            //     printf(
-            //         "  Actual:   0x%02x\n",
-            //         static_cast<unsigned char>(compressed_data[i]));
-            //     correct = false;
-            //     break;
-            // }
+            if (compressed_data[i] != compressed_data_expected[i]) {
+                printf("Mismatch in compressed data at index %zu:\n", i);
+                printf(
+                    "  Expected: 0x%02x\n",
+                    static_cast<unsigned char>(compressed_data_expected[i]));
+                printf(
+                    "  Actual:   0x%02x\n",
+                    static_cast<unsigned char>(compressed_data[i]));
+                correct = false;
+                break;
+            }
             if (compressed_lengths[i] != compressed_lengths_expected[i]) {
                 printf("Mismatch in compressed lengths at index %zu:\n", i);
                 printf("  Expected: %u\n", compressed_lengths_expected[i]);
