@@ -48,13 +48,11 @@ void scan_cpu(size_t n, typename Op::Data const *x, typename Op::Data *out) {
 
 namespace scan_gpu {
 
-static constexpr int32_t T = 4;
+static constexpr int32_t T = 8;
 static constexpr int32_t W = 32 * T; // each warp does 32 * T elements
 
 static constexpr int32_t num_warps_per_block = 32;
-static constexpr int32_t stage_stride = num_warps_per_block * 32;
-
-static constexpr int32_t num_warmup = 16;
+static constexpr int32_t block_stride = num_warps_per_block * 32;
 
 __forceinline__ int32_t ceil_div(int32_t a, int32_t b) {
     return (a + b - 1) / b;
@@ -129,21 +127,20 @@ __global__ void partial_reduce(
     Data* shared_mem = reinterpret_cast<Data*>(shared_mem_);
 
     auto do_cp_async = [&](int32_t warp_offset /* 0..T-1 */, Data* shared_dst) { 
-        if (lane < 8) {
-            // per-warp copy
-            const int32_t dst_idx = warp_idx * 32;
-            const int32_t src_idx = warp_idx0 + 32 * warp_offset;
-            Data* dst_tile = shared_dst + dst_idx;
-            const Data* src_tile = x + src_idx;
-            const bool bound_ok = (src_idx + lane * 4 + 3 < n);
+        // per-warp copy
+        const int32_t dst_idx = warp_idx * 128 * (T / 4) + 128 * warp_offset;
+        const int32_t src_idx = warp_idx0 + 128 * warp_offset;
+        
+        Data* dst_tile = shared_dst + dst_idx;
+        const Data* src_tile = x + src_idx;
+        const bool bound_ok = (src_idx + lane * 4 + 3 < n);
 
-            if (bound_ok) {
-                cp_async4_<Op>(dst_tile + lane * 4, src_tile + lane * 4);
-            } else {
-                for (int32_t idx = 0; idx < 4; ++idx) {
-                    if (src_idx + lane * 4 + idx < n) {
-                        cp_async_<Op>(dst_tile + lane * 4 + idx, src_tile + lane * 4 + idx);
-                    }
+        if (bound_ok) {
+            cp_async4_<Op>(dst_tile + lane * 4, src_tile + lane * 4);
+        } else {
+            for (int32_t idx = 0; idx < 4; ++idx) {
+                if (src_idx + lane * 4 + idx < n) {
+                    cp_async_<Op>(dst_tile + lane * 4 + idx, src_tile + lane * 4 + idx);
                 }
             }
         }
@@ -151,7 +148,8 @@ __global__ void partial_reduce(
 
     Data reg[T];
     auto do_shfl = [&](int32_t warp_offset, Data init_val, const Data* shared_src) {
-        reg[warp_offset] = shared_src[warp_idx * 32 + lane];
+        // reg[warp_offset] = shared_src[warp_idx * 32 + lane];
+        reg[warp_offset] = shared_src[lane];
         Data sum;
         for (int32_t idx = 1; idx < 32; idx = idx * 2) {
             sum = __shfl_up_sync(0xFFFFFFFF, reg[warp_offset], idx);
@@ -163,18 +161,19 @@ __global__ void partial_reduce(
         inter[warp_idx0 + 32 * warp_offset + lane] = reg[warp_offset];
     };
 
-    for (int32_t t = 0; t < num_warmup; ++t) {
-        do_cp_async(t, shared_mem + stage_stride * t);
+    for (int32_t t = 0; t < T / 4; ++t) {
+        do_cp_async(t, shared_mem);
         async_commit_group();
     }
-    async_wait_pending<num_warmup - T + 1>();
+    async_wait_pending<0>();
 
     for (int32_t t = 0; t < T; ++t) {
+        Data* shared_mem_tile = shared_mem + warp_idx * (128 * (T / 4)) + (t / 4) * 128 + (t % 4) * 32;
         if (t == 0) {
-            do_shfl(t, Op::identity(), shared_mem + stage_stride * t);
+            do_shfl(t, Op::identity(), shared_mem_tile);
         } else {
             Data carry = __shfl_sync(0xFFFFFFFF, reg[t - 1], 31);
-            do_shfl(t, carry, shared_mem + stage_stride * t);
+            do_shfl(t, carry, shared_mem_tile);
         }
     }
 }
@@ -189,30 +188,9 @@ __global__ void warp_fixup(
 
     const int32_t lane = threadIdx.x; // 0..32
     const int32_t warp_idx = threadIdx.y;
-    const int32_t warp_idx0 = blockIdx.x * (num_warps_per_block * W) + warp_idx * W;
 
     extern __shared__ __align__(16) char shared_mem_[];
     Data* shared_mem = reinterpret_cast<Data*>(shared_mem_);
- 
-    auto do_cp_async = [&](int32_t warp_offset /* 0..T-1 */, Data* shared_dst) {
-        // per-warp copy
-        int32_t dst_idx = warp_idx * 32;
-        int32_t src_idx = warp_idx0 + 32 * warp_offset;
-        Data* dst_tile = shared_dst + dst_idx;
-        const Data* src_tile = inter + src_idx;
-        bool bound_ok = (src_idx + lane * 4 + 3 < n);
-        if (lane < 8) {
-            if (bound_ok) {
-                cp_async4_<Op>(dst_tile + lane * 4, src_tile + lane * 4);
-            } else {
-                for (int32_t idx = 0; idx < 4; ++idx) {
-                    if (src_idx + lane * 4 + idx < n) {
-                        cp_async_<Op>(dst_tile + lane * 4 + idx, src_tile + lane * 4 + idx);
-                    }
-                }
-            }
-        }
-    };
 
     auto fetch_last_partials = [&]() {
         if (warp_idx == 0 && lane == 0) {
@@ -268,24 +246,24 @@ __global__ void finalize(
 
     extern __shared__ __align__(16) char shared_mem_[];
     Data* shared_mem = reinterpret_cast<Data*>(shared_mem_);
-    Data* shared_mem_partials = shared_mem + T * stage_stride;
+    Data* shared_mem_partials = shared_mem + T * block_stride;
     Data* shared_mem_block_carries = shared_mem_partials + num_warps_per_block;
  
     auto do_cp_async = [&](int32_t warp_offset /* 0..T-1 */, Data* shared_dst) {
         // per-warp copy
-        int32_t dst_idx = warp_idx * 32;
-        int32_t src_idx = warp_idx0 + 32 * warp_offset;
+        const int32_t dst_idx = warp_idx * 128 * (T / 4) + 128 * warp_offset;
+        const int32_t src_idx = warp_idx0 + 128 * warp_offset;
+        
         Data* dst_tile = shared_dst + dst_idx;
         const Data* src_tile = inter + src_idx;
-        bool bound_ok = (src_idx + lane * 4 + 3 < n);
-        if (lane < 8) {
-            if (bound_ok) {
-                cp_async4_<Op>(dst_tile + lane * 4, src_tile + lane * 4);
-            } else {
-                for (int32_t idx = 0; idx < 4; ++idx) {
-                    if (src_idx + lane * 4 + idx < n) {
-                        cp_async_<Op>(dst_tile + lane * 4 + idx, src_tile + lane * 4 + idx);
-                    }
+        const bool bound_ok = (src_idx + lane * 4 + 3 < n);
+
+        if (bound_ok) {
+            cp_async4_<Op>(dst_tile + lane * 4, src_tile + lane * 4);
+        } else {
+            for (int32_t idx = 0; idx < 4; ++idx) {
+                if (src_idx + lane * 4 + idx < n) {
+                    cp_async_<Op>(dst_tile + lane * 4 + idx, src_tile + lane * 4 + idx);
                 }
             }
         }
@@ -333,33 +311,22 @@ __global__ void finalize(
     __syncthreads();
 
     const Data block_carry = (blockIdx.x == 0) ? Op::identity() : shared_mem_block_carries[0];
-    const Data partial_reg = shared_mem_partials[warp_idx - 1];
+    const Data partial_reg = (warp_idx == 0) ? Op::identity() : shared_mem_partials[warp_idx - 1];
+
+    for (int32_t t = 0; t < (T / 4); ++t) {
+        do_cp_async(t, shared_mem);
+        async_commit_group();
+    }
+    async_wait_pending<0>();
+    __syncthreads();
 
     for (int32_t t = 0; t < T; ++t) {
-        if (t == 0) {
-            // initiate prefetch for t = 0
-            do_cp_async(t, shared_mem + stage_stride * t);
-            async_commit_group();
-        }
+        Data* shared_mem_tile = shared_mem + warp_idx * (128 * (T / 4)) + (t / 4) * 128 + (t % 4) * 32;
 
-        async_wait_pending<0>();
-        __syncthreads();
-
-        const int32_t next = t + 1;
-        if (next < T) {
-            do_cp_async(next, shared_mem + stage_stride * next);
-            async_commit_group();
-        }
-
-        const Data* stage = shared_mem + stage_stride * t;
-        Data val = stage[warp_idx * 32 + lane];
-
-        __syncthreads();
-
+        Data val = shared_mem_tile[lane];
         const int32_t idx = warp_idx0 + 32 * t + lane;
         if (idx < n) {
-            Data carry = (warp_idx == 0) ? Op::identity() : partial_reg;
-            val = Op::combine(carry, val);
+            val = Op::combine(partial_reg, val);
             inter[idx] = Op::combine(val, block_carry);
         }
     }
@@ -418,7 +385,7 @@ typename Op::Data *launch_scan(
     /* TODO: your CPU code here... */
 
     Data* out = reinterpret_cast<Data*>(workspace_);
-    const int32_t shmem_size_tiles = max(T, num_warmup) * stage_stride /* (this is num_warps_per_block * 32) */ * sizeof(Data);
+    const int32_t shmem_size_tiles = T * block_stride /* (this is num_warps_per_block * 32) */ * sizeof(Data);
 
     const dim3 block(32, num_warps_per_block, 1);
     const int32_t grid = ceil_div(n, num_warps_per_block * W);
