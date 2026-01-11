@@ -867,7 +867,7 @@ __global__ void accum_counts(
     }
 }
 
-static constexpr int32_t T_sparse = 24;
+static constexpr int32_t T_sparse = 16;
 
 __global__ void sparse_memcpy(
     const uint32_t* sparse_indices,
@@ -875,7 +875,10 @@ __global__ void sparse_memcpy(
     const char* src,
     char* dst
 ) {
-    const int32_t idx_T = (blockIdx.x * blockDim.x + threadIdx.x) * T_sparse;
+    const int tid_in_block = threadIdx.y * blockDim.x + threadIdx.x;
+    const int tid_global = blockIdx.x * (blockDim.x * blockDim.y) + tid_in_block;
+    const int idx_T = tid_global * T_sparse;
+
     if (idx_T == 0) {
         dst[0] = src[0];
     }
@@ -972,9 +975,9 @@ uint32_t launch_rle_compress(
         }
     }
     {
-        static constexpr int32_t num_warps_per_block_ = 16;
+        static constexpr int32_t num_warps_per_block_ = 8;
         const dim3 block(32, num_warps_per_block_, 1);
-        const int32_t grid = ceil_div(raw_count, num_warps_per_block_ * T_sparse);
+        const int32_t grid = ceil_div(compressed_count, block.x * block.y * T_sparse);
         sparse_memcpy<<<grid, block>>>(cc_scan_results, compressed_count, raw, compressed_data);
 
         cudaError_t e = cudaGetLastError();
@@ -1058,7 +1061,6 @@ Results run_config(Mode mode, std::vector<char> const &raw) {
         workspace,
         compressed_data_gpu,
         compressed_lengths_gpu);
-    // printf("count: %u\n", compressed_count);
     std::vector<char> compressed_data(compressed_count);
     std::vector<uint32_t> compressed_lengths(compressed_count);
     CUDA_CHECK(cudaMemcpy(
