@@ -22,12 +22,68 @@ typedef __nv_bfloat16 bf16;
 template <int TILE_M, int TILE_N>
 __global__ void single_tma_load(__grid_constant__ const CUtensorMap src_map,
                                 bf16 *dest) {
-    /* TODO: your TMA load code here... */
+    const int32_t lane = threadIdx.x;
+    const int32_t block_tid = threadIdx.y * blockDim.x + lane;
+
+    extern __shared__ __align__(128) bf16 shared_mem[];
+    __shared__ __align__(8) uint64_t bar;
+    
+    if (block_tid == 0) {
+        init_barrier(&bar, blockDim.x * blockDim.y);
+    }
+    async_proxy_fence();
+    __syncthreads();
+
+    if (block_tid == 0) {
+        cp_async_bulk_tensor_2d_global_to_shared(
+            shared_mem,
+            &src_map,
+            0,
+            0,
+            &bar);
+        expect_bytes(&bar, TILE_M * TILE_N * sizeof(bf16));
+    }
+    arrive(&bar, 1);
+
+    wait(&bar, 0);
+    __syncthreads();
+
+    for (int32_t idx = block_tid; idx < TILE_M * TILE_N; idx += blockDim.x * blockDim.y) {
+        dest[idx] = shared_mem[idx];
+    }
 }
+
 
 template <int TILE_M, int TILE_N>
 void launch_single_tma_load(bf16 *src, bf16 *dest) {
     /* TODO: your launch code here... */
+
+    const cuuint64_t global_dim[2] = {TILE_N, TILE_M};
+    const cuuint64_t global_strides[1] = {TILE_N * sizeof(bf16)}; // has size tensor_rank - 1
+    const cuuint32_t box_dim[2] = {TILE_N, TILE_M};
+    const cuuint32_t element_strides[2] = {1, 1};
+
+    CUtensorMap src_map;
+
+    auto res = cuTensorMapEncodeTiled(
+        &src_map,
+        CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+        2, // 2D
+        src,
+        global_dim,
+        global_strides,
+        box_dim,
+        element_strides,
+        CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_NONE,
+        CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+    );
+
+    dim3 block(32, 1, 1);
+    dim3 grid(1, 1, 1);
+    const int32_t shmem_size = (TILE_M * TILE_N) * sizeof(bf16);
+    single_tma_load<TILE_M, TILE_N><<<grid, block, shmem_size>>>(src_map, dest);
 }
 
 /// <--- /your code here --->
