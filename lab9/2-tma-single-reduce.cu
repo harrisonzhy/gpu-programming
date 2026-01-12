@@ -25,6 +25,16 @@ __device__ static __forceinline__ void
 cp_async_reduce_add_bulk_tensor_2d_shared_to_global(
     const CUtensorMap *tensor_map, int c0, int c1, const void *src) {
     /* TODO: your TMA reduce intrinsic here... */
+    uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(src));
+    asm volatile(
+        "cp.reduce.async.bulk.tensor.2d.global.shared::cta.add.tile.bulk_group "
+        "[%0, {%1, %2}], [%3];\n"
+        :
+        : "l"(tensor_map),
+          "r"(c0),
+          "r"(c1),
+          "r"(smem_addr)
+        : "memory");
 }
 
 template <int TILE_M, int TILE_N>
@@ -32,11 +42,91 @@ __global__ void
 single_tma_reduce(__grid_constant__ const CUtensorMap src_map,
                   __grid_constant__ const CUtensorMap dest_map) {
     /* TODO: your TMA store code here... */
+    
+    const int32_t lane = threadIdx.x;
+    const int32_t block_tid = threadIdx.y * blockDim.x + lane;
+
+    extern __shared__ __align__(128) bf16 shared_mem[];
+    __shared__ __align__(8) uint64_t bar;
+    
+    if (block_tid == 0) {
+        init_barrier(&bar, blockDim.x * blockDim.y);
+    }
+    async_proxy_fence();
+    __syncthreads();
+
+    if (block_tid == 0) {
+        cp_async_bulk_tensor_2d_global_to_shared(
+            shared_mem,
+            &src_map,
+            0,
+            0,
+            &bar);
+        expect_bytes(&bar, TILE_M * TILE_N * sizeof(bf16));
+    }
+    arrive(&bar, 1);
+
+    wait(&bar, 0);
+    __syncthreads();
+
+    if (block_tid == 0) {
+        cp_async_reduce_add_bulk_tensor_2d_shared_to_global(
+            &dest_map,
+            0,
+            0,
+            shared_mem
+        );
+        tma_commit_group();
+    }
+    tma_wait_until_pending<0>();
 }
 
 template <int TILE_M, int TILE_N>
 void launch_single_tma_reduce(bf16 *src, bf16 *dest) {
     /* TODO: your launch code here... */
+
+    const cuuint64_t global_dim[2] = {TILE_N, TILE_M};
+    const cuuint64_t global_strides[1] = {TILE_N * sizeof(bf16)}; // has size tensor_rank - 1
+    const cuuint32_t box_dim[2] = {TILE_N, TILE_M};
+    const cuuint32_t element_strides[2] = {1, 1};
+
+    CUtensorMap src_map;
+    CUtensorMap dst_map;
+
+    cuTensorMapEncodeTiled(
+        &src_map,
+        CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+        2, // 2D
+        src,
+        global_dim,
+        global_strides,
+        box_dim,
+        element_strides,
+        CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_NONE,
+        CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+    );
+
+    cuTensorMapEncodeTiled(
+        &dst_map,
+        CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+        2, // 2D
+        dest,
+        global_dim,
+        global_strides,
+        box_dim,
+        element_strides,
+        CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_NONE,
+        CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+    );
+
+    dim3 block(32, 1, 1);
+    dim3 grid(1, 1, 1);
+    const int32_t shmem_size = (TILE_M * TILE_N) * sizeof(bf16);
+    single_tma_reduce<TILE_M, TILE_N><<<grid, block, shmem_size>>>(src_map, dst_map);
 }
 
 /// <--- /your code here --->
