@@ -65,7 +65,7 @@ void launch_single_tma_load(bf16 *src, bf16 *dest) {
 
     CUtensorMap src_map;
 
-    auto res = cuTensorMapEncodeTiled(
+    cuTensorMapEncodeTiled(
         &src_map,
         CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
         2, // 2D
