@@ -33,6 +33,38 @@ __global__ void tma_swizzle(__grid_constant__ const CUtensorMap src_map,
     // cp_async_bulk_tensor_2d_global_to_shared.
 
     /* TODO: your launch code here... */
+
+    const int32_t lane = threadIdx.x;
+    const int32_t block_tid = threadIdx.y * blockDim.x + lane;
+
+    __shared__ alignas(8) uint64_t bar;
+
+    if (block_tid == 0) {
+        init_barrier(&bar, 1);
+    }
+    async_proxy_fence();
+    __syncthreads();
+
+    if (block_tid == 0) {
+        void* smem_dst = (void*)__cvta_generic_to_shared(smem_buffer);
+        cp_async_bulk_tensor_2d_global_to_shared(
+            smem_dst,
+            &src_map,
+            0,
+            0,
+            &bar);
+        expect_bytes_and_arrive(&bar, TILE_M * TILE_N * sizeof(datatype));
+    }
+
+    if (block_tid == 0) {
+        wait(&bar, 0);
+    }
+    __syncthreads();
+
+    for (int32_t idx = block_tid; idx < TILE_M * TILE_N; idx += blockDim.x * blockDim.y) {
+        const int32_t src_idx = (((idx >> 4) ^ OFFSET) << 4) | (idx & 15);
+        dest[idx] = smem_buffer[src_idx];
+    }
 }
 
 template <int TILE_M, int TILE_N, int OFFSET>
@@ -46,6 +78,32 @@ void launch_tma_swizzle(datatype *src, datatype *dest) {
      */
 
     /* TODO: your launch code here... */
+
+    const cuuint64_t global_dim[2] = {TILE_N, TILE_M};
+    const cuuint64_t global_strides[1] = {TILE_N * sizeof(datatype)};
+    const cuuint32_t box_dim[2] = {TILE_N, TILE_M};
+    const cuuint32_t element_strides[2] = {1, 1};
+    
+    CUtensorMap src_map;
+
+    cuTensorMapEncodeTiled(
+        &src_map,
+        CU_TENSOR_MAP_DATA_TYPE_UINT8,
+        2, // 2D
+        src,
+        global_dim,
+        global_strides,
+        box_dim,
+        element_strides,
+        CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_64B,
+        CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+    );
+
+    const dim3 block(32, 1, 1);
+    const dim3 grid(1, 1, 1);
+    tma_swizzle<TILE_M, TILE_N, OFFSET><<<grid, block>>>(src_map, dest);
 }
 
 /// <--- your code here --->
