@@ -17,14 +17,128 @@ typedef __nv_bfloat16 bf16;
 // Part 3: TMA Memcpy
 ////////////////////////////////////////////////////////////////////////////////
 
+static constexpr int32_t tile_size = 256; // should be 128-aligned
+static constexpr int32_t tiles_per_block = 8;
+
 __global__ void tma_copy(__grid_constant__ const CUtensorMap tensor_map,
                          __grid_constant__ const CUtensorMap dest_tensor_map,
                          const int N) {
     /* TODO: your TMA memcpy kernel here... */
+    const int32_t lane = threadIdx.x;
+    const int32_t block_tid = threadIdx.y * blockDim.x + lane;
+
+    extern __shared__ __align__(128) bf16 shared_mem[];
+    __shared__ __align__(16) uint64_t bar_[4];
+    
+    if (block_tid == 0) {
+        init_barrier(&bar_[0], blockDim.x * blockDim.y);
+        init_barrier(&bar_[2], blockDim.x * blockDim.y);
+    }
+    async_proxy_fence();
+    __syncthreads();
+
+    int32_t parity[2] = {0, 0};
+    uint64_t* bar[2] = {&bar_[0], &bar_[2]};
+
+    for (int32_t t = 0; t <= tiles_per_block; ++t) {
+        if (t < tiles_per_block) {
+            const int32_t b = (t & 1);
+            if (block_tid == 0) {
+                const int32_t g_src_idx = blockIdx.x * (tiles_per_block * tile_size) + t * tile_size;
+                if (g_src_idx + tile_size <= N) {
+                    cp_async_bulk_tensor_1d_global_to_shared(
+                        shared_mem + b * tile_size,
+                        &tensor_map,
+                        g_src_idx,
+                        bar[b]);
+                    expect_bytes_and_arrive(bar[b], tile_size * sizeof(bf16));
+                } else {
+                    arrive(bar[b], 1);
+                }
+            } else {
+                arrive(bar[b], 1);
+            }
+        }
+        if (t - 1 >= 0) {
+            const int32_t b = (t - 1) & 1;
+            if (block_tid == 0) {
+                wait(bar[b], parity[b]);
+            }
+            if (block_tid == 0) {
+                parity[b] ^= 1;
+            }
+            __syncthreads();
+            if (block_tid == 0) {
+                const int32_t g_dst_idx = blockIdx.x * (tiles_per_block * tile_size) + (t - 1) * tile_size;
+                if (g_dst_idx + tile_size <= N) {
+                    cp_async_bulk_tensor_1d_shared_to_global(
+                        &dest_tensor_map,
+                        g_dst_idx,
+                        shared_mem + b * tile_size
+                    );
+                    tma_commit_group();
+                }
+            }
+            tma_wait_until_pending<0>();
+        }
+    }
+}
+
+__device__ __host__ __forceinline__ int32_t ceil_div(int32_t a, int32_t b) {
+    return (a + b - 1) / b;
 }
 
 void launch_tma_copy(bf16 *dest, bf16 *src, int N) {
     /* TODO: your launch code here... */
+
+    const cuuint64_t global_dim[1] = {static_cast<cuuint64_t>(N)};
+    const cuuint64_t global_strides[1] = {sizeof(bf16)};
+    const cuuint32_t box_dim[1] = {tile_size};
+    const cuuint32_t element_strides[1] = {1};
+
+    CUtensorMap src_map;
+    CUtensorMap dst_map;
+
+    cuTensorMapEncodeTiled(
+        &src_map,
+        CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+        1, // 1D
+        src,
+        global_dim,
+        global_strides,
+        box_dim,
+        element_strides,
+        CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_NONE,
+        CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+    );
+
+    cuTensorMapEncodeTiled(
+        &dst_map,
+        CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+        1, // 1D
+        dest,
+        global_dim,
+        global_strides,
+        box_dim,
+        element_strides,
+        CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_NONE,
+        CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+    );
+
+    dim3 block(32, 2, 1);
+    const int32_t grid = ceil_div(N, tile_size * tiles_per_block);
+    const int32_t shmem_size = 2 * tile_size * sizeof(bf16);
+
+    cudaFuncSetAttribute(
+        tma_copy,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        shmem_size
+    );
+    tma_copy<<<grid, block, shmem_size>>>(src_map, dst_map, N);
 }
 
 /// <--- /your code here --->
