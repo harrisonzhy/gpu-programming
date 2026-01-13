@@ -20,6 +20,10 @@ typedef __nv_bfloat16 bf16;
 static constexpr int32_t tile_size = 256; // should be 128-aligned
 static constexpr int32_t tiles_per_block = 8;
 
+__device__ __host__ __forceinline__ int32_t ceil_div(int32_t a, int32_t b) {
+    return (a + b - 1) / b;
+}
+
 __global__ void tma_copy(__grid_constant__ const CUtensorMap tensor_map,
                          __grid_constant__ const CUtensorMap dest_tensor_map,
                          const int N) {
@@ -28,17 +32,16 @@ __global__ void tma_copy(__grid_constant__ const CUtensorMap tensor_map,
     const int32_t block_tid = threadIdx.y * blockDim.x + lane;
 
     extern __shared__ __align__(128) bf16 shared_mem[];
-    __shared__ __align__(16) uint64_t bar_[4];
+    __shared__ __align__(8) uint64_t bar[2];
     
     if (block_tid == 0) {
-        init_barrier(&bar_[0], blockDim.x * blockDim.y);
-        init_barrier(&bar_[2], blockDim.x * blockDim.y);
+        init_barrier(&bar[0], 1);
+        init_barrier(&bar[1], 1);
     }
     async_proxy_fence();
     __syncthreads();
 
     int32_t parity[2] = {0, 0};
-    uint64_t* bar[2] = {&bar_[0], &bar_[2]};
 
     for (int32_t t = 0; t <= tiles_per_block; ++t) {
         if (t < tiles_per_block) {
@@ -50,21 +53,17 @@ __global__ void tma_copy(__grid_constant__ const CUtensorMap tensor_map,
                         shared_mem + b * tile_size,
                         &tensor_map,
                         g_src_idx,
-                        bar[b]);
-                    expect_bytes_and_arrive(bar[b], tile_size * sizeof(bf16));
+                        &bar[b]);
+                    expect_bytes_and_arrive(&bar[b], tile_size * sizeof(bf16));
                 } else {
-                    arrive(bar[b], 1);
+                    arrive(&bar[b], 1);
                 }
-            } else {
-                arrive(bar[b], 1);
             }
         }
         if (t - 1 >= 0) {
             const int32_t b = (t - 1) & 1;
             if (block_tid == 0) {
-                wait(bar[b], parity[b]);
-            }
-            if (block_tid == 0) {
+                wait(&bar[b], parity[b]);
                 parity[b] ^= 1;
             }
             __syncthreads();
@@ -82,10 +81,6 @@ __global__ void tma_copy(__grid_constant__ const CUtensorMap tensor_map,
             tma_wait_until_pending<0>();
         }
     }
-}
-
-__device__ __host__ __forceinline__ int32_t ceil_div(int32_t a, int32_t b) {
-    return (a + b - 1) / b;
 }
 
 void launch_tma_copy(bf16 *dest, bf16 *src, int N) {
