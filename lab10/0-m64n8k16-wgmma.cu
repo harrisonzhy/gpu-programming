@@ -21,17 +21,79 @@ typedef __nv_bfloat16 bf16;
 template <int TILE_M, int TILE_N, int TILE_K>
 __global__ void wgmma_m64n8k16(bf16 *a, bf16 *b, float *c) {
 
-    // <--- your code here --->
+    const int32_t lane = threadIdx.x;
+    const int32_t warp_id = threadIdx.y;
+    const int32_t tid = warp_id * 32 + lane;
 
-} 
+    __shared__ __align__(128) bf16 shared_mem_a[TILE_M * TILE_K];
+    __shared__ __align__(128) bf16 shared_mem_b[TILE_K * TILE_N];
+
+    // copy A
+    for (int32_t idx = tid; idx < TILE_M * TILE_K; idx += 128) {
+        const int32_t m = idx / TILE_K;
+        const int32_t k = idx % TILE_K;
+
+        const int32_t m_core = m / 8; // which 8-row block
+        const int32_t k_tile = k / 8; // which 8-wide K tile
+        const int32_t k_in = k % 8; // column within 8-wide tile
+        const int32_t m_in = m % 8; // row within 8-row block
+
+        const int32_t tile_idx = m_core * (TILE_K / 8) + k_tile;
+        const int32_t dst_idx = tile_idx * 64 + (m_in * 8 + k_in);
+        shared_mem_a[dst_idx] = a[idx];
+    }
+
+    // copy B
+    for (int32_t idx = tid; idx < TILE_N * TILE_K; idx += 128) {
+        const int32_t n = idx / TILE_K;
+        const int32_t k = idx % TILE_K;
+
+        const int32_t n_core = n / 8; // which 8-row block
+        const int32_t k_tile = k / 8; // which 8-wide K tile
+        const int32_t k_in = k % 8; // column within 8-wide tile
+        const int32_t n_in = n % 8; // row within 8-row block
+
+        const int32_t tile_idx = n_core * (TILE_K / 8) + k_tile;
+        const int32_t dst_idx = tile_idx * 64 /* block elements before this one */ + (n_in * 8 + k_in);
+        shared_mem_b[dst_idx] = b[idx];
+    }
+
+    constexpr uint64_t a_lbo = 128;
+    constexpr uint64_t a_sbo = 128 * (TILE_K / 8);
+    constexpr uint64_t b_lbo = 128;
+    constexpr uint64_t b_sbo = 128 * (TILE_K / 8);
+
+    const uint64_t desc_a = make_smem_desc<NO_SWIZZLE>(shared_mem_a, a_lbo, a_sbo);
+    const uint64_t desc_b = make_smem_desc<NO_SWIZZLE>(shared_mem_b, b_lbo, b_sbo);
+
+    float d[4] = {0};
+
+    warpgroup_arrive();
+    wgmma_n8<0, 1, 1, 0, 0>(desc_a, desc_b, d);
+    wgmma_commit();
+    wgmma_wait<0>();
+
+    const int32_t m_base = 16 * warp_id + (lane / 4);
+    const int32_t m0 = m_base + 0;
+    const int32_t m1 = m_base + 8;
+    const int32_t n0 = 2 * (lane % 4);
+    const int32_t n1 = 2 * (lane % 4) + 1;
+
+    c[n0 * TILE_M + m0] = d[0];
+    c[n1 * TILE_M + m0] = d[1];
+    c[n0 * TILE_M + m1] = d[2];
+    c[n1 * TILE_M + m1] = d[3];
+}
 
 template <int TILE_M, int TILE_N, int TILE_K>
 void launch_wgmma_m64n8k16(bf16 *a, bf16 *b, float *c) {
     
     // <--- your code here --->
 
+    const dim3 block(32, 4, 1);
+    const dim3 grid(1, 1, 1);
+    wgmma_m64n8k16<TILE_M, TILE_N, TILE_K><<<grid, block>>>(a, b, c);
 }
-
 
 ////////////////////////////////////////////////////////////////////////////////
 ///          YOU DO NOT NEED TO MODIFY THE CODE BELOW HERE.                  ///
