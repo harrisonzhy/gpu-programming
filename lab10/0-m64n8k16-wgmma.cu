@@ -26,42 +26,50 @@ __global__ void wgmma_m64n8k16(bf16 *a, bf16 *b, float *c) {
     const int32_t tid = warp_id * 32 + lane;
 
     __shared__ __align__(128) bf16 shared_mem_a[TILE_M * TILE_K];
-    __shared__ __align__(128) bf16 shared_mem_b[TILE_K * TILE_N];
+    __shared__ __align__(128) bf16 shared_mem_b[TILE_N * TILE_K];
+
+    constexpr int core_matrix_rows = 8;
+    constexpr int core_matrix_cols = 16 / sizeof(bf16);
+    constexpr int core_matrix_elements = core_matrix_rows * core_matrix_cols;
+
+    constexpr int CORE_M = TILE_M / core_matrix_rows;
+    constexpr int CORE_K = TILE_K / core_matrix_cols;
+    constexpr int CORE_N = TILE_N / core_matrix_rows;
 
     // copy A
-    for (int32_t idx = tid; idx < TILE_M * TILE_K; idx += 128) {
-        const int32_t m = idx / TILE_K;
-        const int32_t k = idx % TILE_K;
+    for (int32_t idx = tid; idx < CORE_M * CORE_K; idx += 128) {
+        const int32_t m = idx / CORE_K;
+        const int32_t k = idx % CORE_K;
 
-        const int32_t m_core = m / 8; // which 8-row block
-        const int32_t k_tile = k / 8; // which 8-wide K tile
-        const int32_t k_in = k % 8; // column within 8-wide tile
-        const int32_t m_in = m % 8; // row within 8-row block
-
-        const int32_t tile_idx = m_core * (TILE_K / 8) + k_tile;
-        const int32_t dst_idx = tile_idx * 64 + (m_in * 8 + k_in);
-        shared_mem_a[dst_idx] = a[idx];
+        for (int32_t m_in = 0; m_in < core_matrix_rows; ++m_in) {
+            for (int32_t k_in = 0; k_in < core_matrix_cols; ++k_in) {
+                const int32_t tile_idx = m * CORE_K + k;
+                const int32_t dst_idx = tile_idx * core_matrix_elements + (m_in * core_matrix_cols + k_in);
+                const int32_t src_idx = (m * core_matrix_rows + m_in) * TILE_K + (k * core_matrix_cols + k_in);
+                shared_mem_a[dst_idx] = a[src_idx];
+            }
+        }
     }
 
     // copy B
-    for (int32_t idx = tid; idx < TILE_N * TILE_K; idx += 128) {
-        const int32_t n = idx / TILE_K;
-        const int32_t k = idx % TILE_K;
+    for (int32_t idx = tid; idx < CORE_N * CORE_K; idx += 128) {
+        const int32_t n = idx / CORE_K;
+        const int32_t k = idx % CORE_K;
 
-        const int32_t n_core = n / 8; // which 8-row block
-        const int32_t k_tile = k / 8; // which 8-wide K tile
-        const int32_t k_in = k % 8; // column within 8-wide tile
-        const int32_t n_in = n % 8; // row within 8-row block
-
-        const int32_t tile_idx = n_core * (TILE_K / 8) + k_tile;
-        const int32_t dst_idx = tile_idx * 64 /* block elements before this one */ + (n_in * 8 + k_in);
-        shared_mem_b[dst_idx] = b[idx];
+        for (int32_t n_in = 0; n_in < core_matrix_rows; ++n_in) {
+            for (int32_t k_in = 0; k_in < core_matrix_cols; ++k_in) {
+                const int32_t tile_idx = n * CORE_K + k;
+                const int32_t dst_idx = tile_idx * core_matrix_elements + (n_in * core_matrix_cols + k_in);
+                const int32_t src_idx = (n * core_matrix_rows + n_in) * TILE_K + (k * core_matrix_cols + k_in);
+                shared_mem_b[dst_idx] = b[src_idx];
+            }
+        }
     }
 
-    constexpr uint64_t a_lbo = 128;
-    constexpr uint64_t a_sbo = 128 * (TILE_K / 8);
-    constexpr uint64_t b_lbo = 128;
-    constexpr uint64_t b_sbo = 128 * (TILE_K / 8);
+    constexpr uint64_t a_lbo = core_matrix_elements * sizeof(bf16);
+    constexpr uint64_t a_sbo = core_matrix_elements * CORE_K * sizeof(bf16);
+    constexpr uint64_t b_lbo = core_matrix_elements * sizeof(bf16);
+    constexpr uint64_t b_sbo = core_matrix_elements * CORE_K * sizeof(bf16);
 
     const uint64_t desc_a = make_smem_desc<NO_SWIZZLE>(shared_mem_a, a_lbo, a_sbo);
     const uint64_t desc_b = make_smem_desc<NO_SWIZZLE>(shared_mem_b, b_lbo, b_sbo);
@@ -146,10 +154,36 @@ int main() {
     }
     cudaMemcpy(d_c, gpu_output, M * N * sizeof(float), cudaMemcpyHostToDevice);
 
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+
+    printf("\n\nWarmup M=%d, N=%d, K=%d...\n", M, N, K);
+    {
+        launch_wgmma_m64n8k16<M, N, K>(d_a, d_b, d_c);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+
     printf("\n\nRunning No Swizzle WGMMA M=%d, N=%d, K=%d...\n\n", M, N, K);
-    launch_wgmma_m64n8k16<M, N, K>(d_a, d_b, d_c);
-    cudaDeviceSynchronize();
-    CUDA_CHECK(cudaGetLastError());
+    {
+        CUDA_CHECK(cudaEventRecord(start, 0));
+
+        constexpr int32_t iters = 1000;
+        for (int i = 0; i < iters; ++i)
+            launch_wgmma_m64n8k16<M, N, K>(d_a, d_b, d_c);
+
+        CUDA_CHECK(cudaEventRecord(stop, 0));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+
+        cudaDeviceSynchronize();
+        CUDA_CHECK(cudaGetLastError());
+
+        float ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+        printf("kernel time: %.6f ms\n", ms / iters);
+        CUDA_CHECK(cudaEventDestroy(start));
+        CUDA_CHECK(cudaEventDestroy(stop));
+    }
 
     cudaMemcpy(gpu_output, d_c, M * N * sizeof(float), cudaMemcpyDeviceToHost);
 
