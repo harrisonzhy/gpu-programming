@@ -19,16 +19,147 @@ typedef __nv_bfloat16 bf16;
 ////////////////////////////////////////////////////////////////////////////////
 
 template <int TILE_M, int TILE_N, int TILE_K>
-__global__ void swizzle_wgmma_m64n8k32(bf16 *a, bf16 *b, float *c) {
+__global__ void swizzle_wgmma_m64n8k32(
+    __grid_constant__ const CUtensorMap src_map_a, 
+    __grid_constant__ const CUtensorMap src_map_b,
+    float* c) {
 
     // <--- your code here --->
 
+    const int32_t lane = threadIdx.x;
+    const int32_t warp_id = threadIdx.y;
+    const int32_t block_tid = warp_id * 32 + lane;
+
+    __shared__ alignas(128) bf16 shared_mem_a[TILE_M * TILE_K];
+    __shared__ alignas(128) bf16 shared_mem_b[TILE_N * TILE_K];
+
+    __shared__ alignas(8) uint64_t bar;
+
+    if (block_tid == 0) {
+        init_barrier(&bar, 1);
+    }
+    async_proxy_fence();
+    __syncthreads();
+
+    if (block_tid == 0) {
+        void* smem_dst = (void*)__cvta_generic_to_shared(shared_mem_a);
+        cp_async_bulk_tensor_2d_global_to_shared(
+            smem_dst,
+            &src_map_a,
+            0,
+            0,
+            &bar);
+        expect_bytes_and_arrive(&bar, TILE_M * TILE_K * sizeof(bf16));
+        wait(&bar, 0);
+    }
+    __syncthreads();
+
+    if (block_tid == 0) {
+        void* smem_dst = (void*)__cvta_generic_to_shared(shared_mem_b);
+        cp_async_bulk_tensor_2d_global_to_shared(
+            smem_dst,
+            &src_map_b,
+            0,
+            0,
+            &bar);
+        expect_bytes_and_arrive(&bar, TILE_N * TILE_K * sizeof(bf16));
+        wait(&bar, 1);
+    }
+    __syncthreads();
+
+    constexpr int core_matrix_rows = 8;
+    constexpr int core_matrix_cols = 16 / sizeof(bf16);
+    constexpr int core_matrix_elements = core_matrix_rows * core_matrix_cols;
+    constexpr int CORE_K = TILE_K / core_matrix_cols;
+
+    async_proxy_fence();
+    warpgroup_arrive();
+
+    float d[4];
+    {
+        constexpr uint64_t a_sbo = core_matrix_elements * CORE_K * sizeof(bf16);
+        constexpr uint64_t b_sbo = core_matrix_elements * CORE_K * sizeof(bf16);
+        const uint64_t desc_a = make_smem_desc<SWIZZLE_64B>(shared_mem_a, 1 /* ignored in swizzled */, a_sbo);
+        const uint64_t desc_b = make_smem_desc<SWIZZLE_64B>(shared_mem_b, 1 /* ignored in swizzled */, b_sbo);
+
+        wgmma_n8<0, 1, 1, 0, 0>(desc_a, desc_b, d);
+    }
+    {
+        constexpr uint64_t a_sbo = core_matrix_elements * CORE_K * sizeof(bf16);
+        constexpr uint64_t b_sbo = core_matrix_elements * CORE_K * sizeof(bf16);
+        const uint64_t desc_a = make_smem_desc<SWIZZLE_64B>(shared_mem_a + 16, 1 /* ignored in swizzled */, a_sbo);
+        const uint64_t desc_b = make_smem_desc<SWIZZLE_64B>(shared_mem_b + 16, 1 /* ignored in swizzled */, b_sbo);
+
+        wgmma_n8<1, 1, 1, 0, 0>(desc_a, desc_b, d);
+    }
+    wgmma_commit();
+    wgmma_wait<0>();
+
+    const int32_t m_base = 16 * warp_id + (lane / 4);
+    const int32_t m0 = m_base + 0;
+    const int32_t m1 = m_base + 8;
+    const int32_t n0 = 2 * (lane % 4);
+    const int32_t n1 = 2 * (lane % 4) + 1;
+
+    c[n0 * TILE_M + m0] = d[0];
+    c[n1 * TILE_M + m0] = d[1];
+    c[n0 * TILE_M + m1] = d[2];
+    c[n1 * TILE_M + m1] = d[3];
 }
 
 template <int TILE_M, int TILE_N, int TILE_K>
 void launch_swizzle_wgmma_m64n8k32(bf16 *a, bf16 *b, float *c) {
 
     // <--- your code here --->
+
+    CUtensorMap src_map_a;
+    {
+        const cuuint64_t global_dim[2] = {TILE_K, TILE_M};
+        const cuuint64_t global_strides[1] = {TILE_K * sizeof(bf16)};
+        const cuuint32_t box_dim[2] = {TILE_K, TILE_M};
+        const cuuint32_t element_strides[2] = {1, 1};
+
+        cuTensorMapEncodeTiled(
+            &src_map_a,
+            CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+            2, // 2D
+            a,
+            global_dim,
+            global_strides,
+            box_dim,
+            element_strides,
+            CU_TENSOR_MAP_INTERLEAVE_NONE,
+            CU_TENSOR_MAP_SWIZZLE_64B,
+            CU_TENSOR_MAP_L2_PROMOTION_NONE,
+            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+        );
+    }
+    CUtensorMap src_map_b;
+    {
+        const cuuint64_t global_dim[2] = {TILE_K, TILE_N};
+        const cuuint64_t global_strides[1] = {TILE_K * sizeof(bf16)};
+        const cuuint32_t box_dim[2] = {TILE_K, TILE_N};
+        const cuuint32_t element_strides[2] = {1, 1};
+
+        cuTensorMapEncodeTiled(
+            &src_map_b,
+            CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+            2, // 2D
+            b,
+            global_dim,
+            global_strides,
+            box_dim,
+            element_strides,
+            CU_TENSOR_MAP_INTERLEAVE_NONE,
+            CU_TENSOR_MAP_SWIZZLE_64B,
+            CU_TENSOR_MAP_L2_PROMOTION_NONE,
+            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+        );
+    }
+
+    const dim3 block(32, 4, 1);
+    const dim3 grid(1, 1, 1);
+    swizzle_wgmma_m64n8k32<TILE_M, TILE_N, TILE_K><<<grid, block>>>(src_map_a, src_map_b, c);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
