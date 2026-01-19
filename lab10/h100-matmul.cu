@@ -24,6 +24,8 @@ static constexpr int32_t TILE_M = 128;
 static constexpr int32_t TILE_K = 64;
 static constexpr int32_t TILE_N = 256;
 
+static constexpr int32_t BIG_TILE_M = TILE_M * 4;
+static constexpr int32_t BIG_TILE_N = TILE_N * 4;
 static constexpr int32_t BIG_TILE_K = 128;
 
 static constexpr int32_t N_BUFFERS = 2;
@@ -35,7 +37,8 @@ __global__ void h100_matmul(
     int M, int N, int K,
     __grid_constant__ const CUtensorMap src_map_a, 
     __grid_constant__ const CUtensorMap src_map_b,
-    bf16* c
+    __grid_constant__ const CUtensorMap dst_map_c
+    // bf16* c
 ) {
 
     // <--- your code here --->
@@ -61,6 +64,8 @@ __global__ void h100_matmul(
     __shared__ alignas(8) uint64_t bar_b[N_BUFFERS];
     __shared__ alignas(8) uint64_t bar_empty[N_BUFFERS];
 
+    __shared__ alignas(128) bf16 shared_c[64 * TILE_N]; // each warp group outputs (64x256) values
+
     int32_t parity_a[N_BUFFERS] = {0};
     int32_t parity_b[N_BUFFERS] = {0};
     int32_t parity_empty[N_BUFFERS] = {0};
@@ -78,156 +83,177 @@ __global__ void h100_matmul(
     async_proxy_fence();
     __syncthreads();
 
-    const int32_t M0 = blockIdx.x * TILE_M;
-    const int32_t N0 = blockIdx.y * TILE_N;
-
-    float d[16][8] = {}; // N=256, i.e. each thread holds (64x256)/128 output values
-
     const bool is_consumer = (warp_group_id != 2);
     const int32_t consumer_id = warp_group_id;
     const bool is_producer = (warp_id == 4 * 2) && (lane == 0);
 
-    // preload
-    if (is_producer) {
-        for (int32_t p = 0; p < N_OVERLAY; ++p) {
-            const int32_t buf = p % N_BUFFERS;
+    float d[16][8] = {}; // N=256, i.e. each thread holds (64x256)/128 output values
 
-            wait(&bar_empty[buf], parity_empty[buf]);
-            parity_empty[buf] ^= 1;
+    for (int32_t M0 = blockIdx.x * BIG_TILE_M; M0 < (blockIdx.x + 1) * BIG_TILE_M; M0 += TILE_M) {
+        for (int32_t N0 = blockIdx.y * BIG_TILE_N; N0 < (blockIdx.y + 1) * BIG_TILE_N; N0 += TILE_N) {
 
-            for (int32_t k_load = 0; k_load < BIG_TILE_K / TILE_K; ++k_load) {
-                // preload a tile of A (NxK)
-                {
-                    bf16* shared_mem_a_dst = shared_mem_a + buf * (TILE_M * BIG_TILE_K) + k_load * (TILE_M * TILE_K);
-                    void* smem_dst = (void*)__cvta_generic_to_shared(shared_mem_a_dst);
-                    cp_async_bulk_tensor_2d_global_to_shared(
-                        smem_dst,
-                        &src_map_a,
-                        p * BIG_TILE_K + k_load * TILE_K, // faster moving index (first dim)
-                        M0,
-                        &bar_a[buf]);
-                    expect_bytes_and_arrive(&bar_a[buf], TILE_M * TILE_K * sizeof(bf16));
-                }
-                // preload a tile of B (NxK)
-                {
-                    bf16* shared_mem_b_dst = shared_mem_b + buf * (TILE_N * BIG_TILE_K) + k_load * (TILE_N * TILE_K);
-                    void* smem_dst = (void*)__cvta_generic_to_shared(shared_mem_b_dst);
-                    cp_async_bulk_tensor_2d_global_to_shared(
-                        smem_dst,
-                        &src_map_b,
-                        p * BIG_TILE_K + k_load * TILE_K, // faster moving index (first dim)
-                        N0,
-                        &bar_b[buf]);
-                    expect_bytes_and_arrive(&bar_b[buf], TILE_N * TILE_K * sizeof(bf16));
-                }
-            }
-        }
-    }
-    async_proxy_fence();
+            // preload
+            if (is_producer) {
+                for (int32_t p = 0; p < N_OVERLAY; ++p) {
+                    const int32_t buf = p % N_BUFFERS;
 
-    for (int32_t k = 0; k < K / BIG_TILE_K; ++k) {
-        const int32_t buf_compute = (k % N_BUFFERS);
+                    wait(&bar_empty[buf], parity_empty[buf]);
+                    parity_empty[buf] ^= 1;
 
-        // issue fetch
-        if (is_producer) {
-            if (k + N_OVERLAY < K / BIG_TILE_K) {
-                const int32_t buf_fetch = ((k + N_OVERLAY) % N_BUFFERS);
-
-                wait(&bar_empty[buf_fetch], parity_empty[buf_fetch]);
-                parity_empty[buf_fetch] ^= 1;
-
-                for (int32_t k_load = 0; k_load < BIG_TILE_K / TILE_K; ++k_load) {
-                    const int32_t next_tile_k_idx = (k + N_OVERLAY) * BIG_TILE_K + k_load * TILE_K;
-
-                    // load a tile of A (NxK)
-                    {
-                        bf16* shared_mem_a_dst = shared_mem_a + buf_fetch * (TILE_M * BIG_TILE_K) + k_load * (TILE_M * TILE_K);
-                        void* smem_dst = (void*)__cvta_generic_to_shared(shared_mem_a_dst);
-                        cp_async_bulk_tensor_2d_global_to_shared(
-                            smem_dst,
-                            &src_map_a,
-                            next_tile_k_idx, // faster moving index (first dim)
-                            M0,
-                            &bar_a[buf_fetch]);
-                        expect_bytes_and_arrive(&bar_a[buf_fetch], TILE_M * TILE_K * sizeof(bf16));
-                    }
-
-                    // load a tile of B (NxK)
-                    {
-                        bf16* shared_mem_b_dst = shared_mem_b + buf_fetch * (TILE_N * BIG_TILE_K) + k_load * (TILE_N * TILE_K);
-                        void* smem_dst = (void*)__cvta_generic_to_shared(shared_mem_b_dst);
-                        cp_async_bulk_tensor_2d_global_to_shared(
-                            smem_dst,
-                            &src_map_b,
-                            next_tile_k_idx, // faster moving index (first dim)
-                            N0,
-                            &bar_b[buf_fetch]);
-                        expect_bytes_and_arrive(&bar_b[buf_fetch], TILE_N * TILE_K * sizeof(bf16));
+                    for (int32_t k_load = 0; k_load < BIG_TILE_K / TILE_K; ++k_load) {
+                        // preload a tile of A (NxK)
+                        {
+                            bf16* shared_mem_a_dst = shared_mem_a + buf * (TILE_M * BIG_TILE_K) + k_load * (TILE_M * TILE_K);
+                            void* smem_dst = (void*)__cvta_generic_to_shared(shared_mem_a_dst);
+                            cp_async_bulk_tensor_2d_global_to_shared(
+                                smem_dst,
+                                &src_map_a,
+                                p * BIG_TILE_K + k_load * TILE_K, // faster moving index (first dim)
+                                M0,
+                                &bar_a[buf]);
+                            expect_bytes_and_arrive(&bar_a[buf], TILE_M * TILE_K * sizeof(bf16));
+                        }
+                        // preload a tile of B (NxK)
+                        {
+                            bf16* shared_mem_b_dst = shared_mem_b + buf * (TILE_N * BIG_TILE_K) + k_load * (TILE_N * TILE_K);
+                            void* smem_dst = (void*)__cvta_generic_to_shared(shared_mem_b_dst);
+                            cp_async_bulk_tensor_2d_global_to_shared(
+                                smem_dst,
+                                &src_map_b,
+                                p * BIG_TILE_K + k_load * TILE_K, // faster moving index (first dim)
+                                N0,
+                                &bar_b[buf]);
+                            expect_bytes_and_arrive(&bar_b[buf], TILE_N * TILE_K * sizeof(bf16));
+                        }
                     }
                 }
             }
-        }
 
-        // wait for `buf_compute`
-        if (is_consumer) {
-            if (lane == 0) {
-                wait(&bar_a[buf_compute], parity_a[buf_compute]);
-                wait(&bar_b[buf_compute], parity_b[buf_compute]);
-                parity_a[buf_compute] ^= 1;
-                parity_b[buf_compute] ^= 1;
-            }
-            __syncwarp();
+            for (int32_t k = 0; k < K / BIG_TILE_K; ++k) {
+                const int32_t buf_compute = (k % N_BUFFERS);
 
-            const int32_t m_offset = consumer_id * (TILE_M / 2);
+                // issue fetch
+                if (is_producer) {
+                    if (k + N_OVERLAY < K / BIG_TILE_K) {
+                        const int32_t buf_fetch = ((k + N_OVERLAY) % N_BUFFERS);
 
-            for (int32_t k_load = 0; k_load < BIG_TILE_K / TILE_K; ++k_load) {
-                bf16* shared_mem_a_base = shared_mem_a + buf_compute * (TILE_M * BIG_TILE_K) + k_load * (TILE_M * TILE_K) + m_offset * TILE_K;
-                bf16* shared_mem_b_base = shared_mem_b + buf_compute * (TILE_N * BIG_TILE_K) + k_load * (TILE_N * TILE_K);
+                        wait(&bar_empty[buf_fetch], parity_empty[buf_fetch]);
+                        parity_empty[buf_fetch] ^= 1;
 
-                for (int32_t kk = 0; kk < TILE_K / 16; ++kk) {
-                    // split-K
-                    constexpr uint64_t a_sbo = core_matrix_elements * CORE_K * sizeof(bf16);
-                    constexpr uint64_t b_sbo = core_matrix_elements * CORE_K * sizeof(bf16);
-                    const uint64_t desc_a = make_smem_desc<SWIZZLE_128B>(shared_mem_a_base + 16 * kk, 1 /* ignored in swizzled */, a_sbo);
-                    const uint64_t desc_b = make_smem_desc<SWIZZLE_128B>(shared_mem_b_base + 16 * kk, 1 /* ignored in swizzled */, b_sbo);
+                        for (int32_t k_load = 0; k_load < BIG_TILE_K / TILE_K; ++k_load) {
+                            const int32_t next_tile_k_idx = (k + N_OVERLAY) * BIG_TILE_K + k_load * TILE_K;
 
-                    wgmma_n256<1, 1, 1, 0, 0>(desc_a, desc_b, d);
+                            // load a tile of A (NxK)
+                            {
+                                bf16* shared_mem_a_dst = shared_mem_a + buf_fetch * (TILE_M * BIG_TILE_K) + k_load * (TILE_M * TILE_K);
+                                void* smem_dst = (void*)__cvta_generic_to_shared(shared_mem_a_dst);
+                                cp_async_bulk_tensor_2d_global_to_shared(
+                                    smem_dst,
+                                    &src_map_a,
+                                    next_tile_k_idx, // faster moving index (first dim)
+                                    M0,
+                                    &bar_a[buf_fetch]);
+                                expect_bytes_and_arrive(&bar_a[buf_fetch], TILE_M * TILE_K * sizeof(bf16));
+                            }
+
+                            // load a tile of B (NxK)
+                            {
+                                bf16* shared_mem_b_dst = shared_mem_b + buf_fetch * (TILE_N * BIG_TILE_K) + k_load * (TILE_N * TILE_K);
+                                void* smem_dst = (void*)__cvta_generic_to_shared(shared_mem_b_dst);
+                                cp_async_bulk_tensor_2d_global_to_shared(
+                                    smem_dst,
+                                    &src_map_b,
+                                    next_tile_k_idx, // faster moving index (first dim)
+                                    N0,
+                                    &bar_b[buf_fetch]);
+                                expect_bytes_and_arrive(&bar_b[buf_fetch], TILE_N * TILE_K * sizeof(bf16));
+                            }
+                        }
+                    }
+                }
+
+                if (is_consumer) {
+                    if (lane == 0) {
+                        // wait for `buf_compute`
+                        wait(&bar_a[buf_compute], parity_a[buf_compute]);
+                        wait(&bar_b[buf_compute], parity_b[buf_compute]);
+                        parity_a[buf_compute] ^= 1;
+                        parity_b[buf_compute] ^= 1;
+                    }
+                    __syncwarp();
+
+                    const int32_t m_offset = consumer_id * (TILE_M / 2);
+
+                    for (int32_t k_load = 0; k_load < BIG_TILE_K / TILE_K; ++k_load) {
+                        bf16* shared_mem_a_base = shared_mem_a + buf_compute * (TILE_M * BIG_TILE_K) + k_load * (TILE_M * TILE_K) + m_offset * TILE_K;
+                        bf16* shared_mem_b_base = shared_mem_b + buf_compute * (TILE_N * BIG_TILE_K) + k_load * (TILE_N * TILE_K);
+
+                        for (int32_t kk = 0; kk < TILE_K / 16; ++kk) {
+                            // split-K
+                            constexpr uint64_t a_sbo = core_matrix_elements * CORE_K * sizeof(bf16);
+                            constexpr uint64_t b_sbo = core_matrix_elements * CORE_K * sizeof(bf16);
+                            const uint64_t desc_a = make_smem_desc<SWIZZLE_128B>(shared_mem_a_base + 16 * kk, 1 /* ignored in swizzled */, a_sbo);
+                            const uint64_t desc_b = make_smem_desc<SWIZZLE_128B>(shared_mem_b_base + 16 * kk, 1 /* ignored in swizzled */, b_sbo);
+
+                            if (k == 0 && k_load == 0 && kk == 0) {
+                                wgmma_n256<0, 1, 1, 0, 0>(desc_a, desc_b, d);
+                            } else {
+                                wgmma_n256<1, 1, 1, 0, 0>(desc_a, desc_b, d);
+                            }
+                        }
+                    }
+                    wgmma_commit();
+                    wgmma_wait<7>();
+
+                    if (local_warp_id == 0 && lane == 0) {
+                        arrive(&bar_empty[buf_compute], 1);
+                    }
                 }
             }
-            wgmma_commit();
-            wgmma_wait<7>();
 
-            if (local_warp_id == 0 && lane == 0) {
-                arrive(&bar_empty[buf_compute], 1);
+            if (block_tid == 0) {
+                tma_wait_until_pending<0>();
             }
-        }
-    }
 
-    if (is_consumer) {
-        // write to output
-        const int32_t m_base = 16 * local_warp_id + (lane / 4);
-        const int32_t m0 = m_base + 0;
-        const int32_t m1 = m_base + 8;
+            // write to shared memory
+            if (is_consumer) {
+                const int32_t m_base = 16 * local_warp_id + (lane / 4);
+                const int32_t m0 = m_base + 0;
+                const int32_t m1 = m_base + 8;
 
-        const int32_t n0 = 2 * (lane % 4);
+                const int32_t n0 = 2 * (lane % 4);
+                const int32_t m_offset = consumer_id * (TILE_M / 2);
 
-        const int32_t m_offset = consumer_id * (TILE_M / 2);
-        const int32_t m00 = (M0 + m_offset) + m0;
-        const int32_t m01 = (M0 + m_offset) + m1;
+                float* df = &d[0][0];
+                for (int32_t frag = 0; frag < 32; ++frag) {
+                    const int32_t n_base = frag * 8;
+                    const int32_t d_base = frag * 4;
 
-        float* df = &d[0][0];
-        for (int32_t frag = 0; frag < 32; ++frag) {
-            const int32_t n_base = frag * 8;
-            const int32_t d_base = frag * 4;
+                    const int32_t smem_n  = n_base + n0;
+                    const int32_t smem_m0 = m_offset + m0;
+                    const int32_t smem_m1 = m_offset + m1;
 
-            const int32_t n00 = N0 + n_base + n0;
+                    const __nv_bfloat162 out0 = __floats2bfloat162_rn(df[d_base + 0], df[d_base + 1]);
+                    const __nv_bfloat162 out1 = __floats2bfloat162_rn(df[d_base + 2], df[d_base + 3]);
 
-            const __nv_bfloat162 out0 = __floats2bfloat162_rn(df[d_base + 0], df[d_base + 1]);
-            const __nv_bfloat162 out1 = __floats2bfloat162_rn(df[d_base + 2], df[d_base + 3]);
-            *reinterpret_cast<__nv_bfloat162*>(&c[m00 * N + n00]) = out0;
-            *reinterpret_cast<__nv_bfloat162*>(&c[m01 * N + n00]) = out1;
-        }
-    }
+                    *reinterpret_cast<__nv_bfloat162*>(&shared_c[smem_m0 * TILE_N + smem_n]) = out0;
+                    *reinterpret_cast<__nv_bfloat162*>(&shared_c[smem_m1 * TILE_N + smem_n]) = out1;
+                }
+            }
+
+            __syncthreads();
+            if (block_tid == 0) {
+                async_proxy_fence();
+                cp_async_bulk_tensor_2d_shared_to_global(
+                    &dst_map_c,
+                    N0,
+                    M0,
+                    shared_c);
+                tma_commit_group();
+            }
+
+        } // N0
+    } // M0
 }
 
 static inline void CHECK_CU(CUresult r, const char* what) {
@@ -297,9 +323,34 @@ void launch_h100_matmul(unsigned M, unsigned N, unsigned K, bf16 *A, bf16 *B, bf
         CHECK_CU(r, "src_map_b");
     }
 
+    CUtensorMap dst_map_c;
+    {
+        const cuuint64_t global_dim[2] = {N, M};
+        const cuuint64_t global_strides[1] = {N * sizeof(bf16)};
+        const cuuint32_t box_dim[2] = {TILE_N, TILE_M};
+        const cuuint32_t element_strides[2] = {1, 1};
+
+        auto r = cuTensorMapEncodeTiled(
+            &dst_map_c,
+            CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+            2, // 2D
+            C,
+            global_dim,
+            global_strides,
+            box_dim,
+            element_strides,
+            CU_TENSOR_MAP_INTERLEAVE_NONE,
+            CU_TENSOR_MAP_SWIZZLE_NONE,
+            CU_TENSOR_MAP_L2_PROMOTION_NONE,
+            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+        );
+
+        CHECK_CU(r, "dst_map_c");
+    }
+
     {
         dim3 block(32, num_warps_per_block, 1);
-        dim3 grid(ceil_div(M, TILE_M), ceil_div(N, TILE_N), 1);
+        dim3 grid(ceil_div(M, BIG_TILE_M), ceil_div(N, BIG_TILE_N), 1);
         const int32_t shmem_size = (N_BUFFERS * TILE_M * BIG_TILE_K + N_BUFFERS * BIG_TILE_K * TILE_N) * sizeof(bf16);
 
         // printf("grid size: (%d, %d, %d)\n", grid.x, grid.y, 1);
@@ -310,7 +361,7 @@ void launch_h100_matmul(unsigned M, unsigned N, unsigned K, bf16 *A, bf16 *B, bf
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             shmem_size));
 
-        h100_matmul<<<grid, block, shmem_size>>>(M, N, K, src_map_a, src_map_b, C);
+        h100_matmul<<<grid, block, shmem_size>>>(M, N, K, src_map_a, src_map_b, dst_map_c);
 
         cudaError_t e = cudaGetLastError();
         if (e != cudaSuccess) {
