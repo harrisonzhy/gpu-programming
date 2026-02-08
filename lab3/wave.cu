@@ -1,5 +1,4 @@
-#include <algorithm>
-#include <chrono>
+
 #include <cstdint>
 #include <cstdio>
 #include <cuda_runtime.h>
@@ -8,6 +7,9 @@
 #include <limits>
 #include <utility>
 #include <vector>
+
+#include <algorithm>
+#include <chrono>
 
 void cuda_check(cudaError_t code, const char *file, int line) {
     if (code != cudaSuccess) {
@@ -126,45 +128,35 @@ __global__ void wave_gpu_naive_step(
     constexpr float c = Scene::c;
     constexpr float dx = Scene::dx;
     constexpr float dt = Scene::dt;
+    
+    const int32_t linear = (gridDim.x * blockIdx.y + blockIdx.x) * (blockDim.x * blockDim.y) + (blockDim.x * threadIdx.y + threadIdx.x);
+    const int32_t idx_y = linear / n_cells_x;
+    const int32_t idx_x = linear % n_cells_x;
 
-    const auto threads_per_block = blockDim.x;
-    const auto num_threads_per_warp = 32;
-    const auto num_blocks = gridDim.x;
-    const auto warps_per_block = threads_per_block / num_threads_per_warp;
-    const auto num_warps = num_blocks * warps_per_block;
-
-    const auto block = blockIdx.x;
-    const auto warp = threadIdx.x / num_threads_per_warp;
-    const auto lane = threadIdx.x % num_threads_per_warp;
-
-    for (int32_t idx_y = block * warps_per_block + warp; idx_y < n_cells_y; idx_y += num_warps) {
-        for (int32_t idx_xx = 0; idx_xx < n_cells_x; idx_xx += 32) {
-            int32_t idx_x = idx_xx + lane;
-            if (idx_x >= n_cells_x) {
-                break;
-            }
-            int32_t idx = idx_y * n_cells_x + idx_x;
-            bool is_border =
-                (idx_x == 0 || idx_x == n_cells_x - 1 || idx_y == 0 ||
-                 idx_y == n_cells_y - 1);
-            float u_next_val;
-            if (is_border || Scene::is_wall(idx_x, idx_y)) {
-                u_next_val = 0.0f;
-            } else if (Scene::is_source(idx_x, idx_y)) {
-                u_next_val = Scene::source_value(idx_x, idx_y, t);
-            } else {
-                constexpr float coeff = c * c * dt * dt / (dx * dx);
-                float damping = Scene::damping(idx_x, idx_y);
-                u_next_val =
-                    ((2.0f - damping - 4.0f * coeff) * u1[idx] -
-                     (1.0f - damping) * u0[idx] +
-                     coeff *
-                         (u1[idx - 1] + u1[idx + 1] + u1[idx - n_cells_x] +
-                          u1[idx + n_cells_x]));
-            }
-            u0[idx] = u_next_val;
-        }
+    if (idx_y >= n_cells_y) {
+	return;
     }
+
+    int32_t idx = idx_y * n_cells_x + idx_x;
+    bool is_border =
+	(idx_x == 0 || idx_x == n_cells_x - 1 || idx_y == 0 ||
+	 idx_y == n_cells_y - 1);
+    float u_next_val;
+    if (is_border || Scene::is_wall(idx_x, idx_y)) {
+	u_next_val = 0.0f;
+    } else if (Scene::is_source(idx_x, idx_y)) {
+	u_next_val = Scene::source_value(idx_x, idx_y, t);
+    } else {
+	constexpr float coeff = c * c * dt * dt / (dx * dx);
+	float damping = Scene::damping(idx_x, idx_y);
+	u_next_val =
+	    ((2.0f - damping - 4.0f * coeff) * u1[idx] -
+	     (1.0f - damping) * u0[idx] +
+	     coeff *
+		 (u1[idx - 1] + u1[idx + 1] + u1[idx - n_cells_x] +
+		  u1[idx + n_cells_x]));
+    }
+    u0[idx] = u_next_val;
 }
 
 // 'wave_gpu_naive':
@@ -192,12 +184,15 @@ std::pair<float *, float *> wave_gpu_naive(
     float *u1  /* pointer to GPU memory */
 ) {
     /* TODO: your CPU code here... */
-    constexpr auto num_blocks = 142;
-    constexpr auto threads_per_block = 32 * 4;
+    constexpr int32_t n_cells_x = Scene::n_cells_x;
+    constexpr int32_t n_cells_y = Scene::n_cells_y;
+
+    dim3 grid(n_cells_x, n_cells_y, 1);
+    dim3 block(32, 32, 1);
 
     for (int32_t idx_step = 0; idx_step < n_steps; idx_step++) {
         float t = t0 + idx_step * Scene::dt;
-        wave_gpu_naive_step<Scene><<<num_blocks, threads_per_block>>>(t, u0, u1);
+        wave_gpu_naive_step<Scene><<<grid, block>>>(t, u0, u1);
         std::swap(u0, u1);
     }
     return {u0, u1};
@@ -235,7 +230,7 @@ __global__ void wave_gpu_shmem_multistep_tile(
     extern __shared__ float shared_mem[];
     float* tile_prev = shared_mem;
     float* tile_curr = shared_mem + (SHARED_W * SHARED_H);
-    float* tile_next = shared_mem + (2 * SHARED_W * SHARED_H);
+    float* tile_next = tile_curr + (SHARED_W * SHARED_H);
 
     auto shared_index = [SHARED_W](int32_t xx, int32_t yy) -> int32_t {
         return yy * SHARED_W + xx;
