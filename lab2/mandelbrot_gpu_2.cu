@@ -93,6 +93,8 @@ void launch_mandelbrot_gpu_vector_ilp(
     uint32_t *out /* pointer to GPU memory */
 ) {
     /* your (CPU) code here... */
+    // placeholder
+    mandelbrot_gpu_vector<<<1, 32>>>(img_size, max_iters, out);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -200,7 +202,7 @@ void launch_mandelbrot_gpu_vector_multicore_multithread_single_sm(
 ////////////////////////////////////////////////////////////////////////////////
 // Vector + Multi-core + Multi-thread-per-core (Full Machine)
 
-static constexpr int32_t num_blocks_all_sm = 142;
+static constexpr int32_t num_blocks_all_sm = 142 /* L40S */;
 
 __global__ void mandelbrot_gpu_vector_multicore_multithread_full(
     uint32_t img_size,
@@ -254,6 +256,7 @@ void launch_mandelbrot_gpu_vector_multicore_multithread_full(
 // Vector + Multi-core + Multi-thread-per-core + ILP (Full Machine)
 
 static constexpr int32_t n_ilp_parallel = 1;
+static constexpr int32_t num_blocks_ilp = 142;
 
 __global__ void mandelbrot_gpu_vector_multicore_multithread_full_ilp(
     uint32_t img_size,
@@ -263,12 +266,12 @@ __global__ void mandelbrot_gpu_vector_multicore_multithread_full_ilp(
     /* your (GPU) code here... */
 
     const int32_t linear = (gridDim.x * blockIdx.y + blockIdx.x) * (blockDim.y * blockDim.x) + (threadIdx.y * blockDim.x + threadIdx.x);
-
     const int32_t num_threads = (gridDim.y * gridDim.x) * (blockDim.y * blockDim.x);
 
+    float cx_arr[n_ilp_parallel];
+    float cy_arr[n_ilp_parallel];
+
     for (uint32_t lin = linear; lin < img_size * img_size; lin += num_threads * n_ilp_parallel) {
-	    float cx_arr[n_ilp_parallel] = {0};
-        float cy_arr[n_ilp_parallel] = {0};
         float x2_arr[n_ilp_parallel] = {0};
         float y2_arr[n_ilp_parallel] = {0};
         float w_arr[n_ilp_parallel] = {0};
@@ -278,7 +281,7 @@ __global__ void mandelbrot_gpu_vector_multicore_multithread_full_ilp(
 	    #pragma unroll n_ilp_parallel
 	    for (uint32_t j_ = 0; j_ < n_ilp_parallel; ++j_) {
             uint32_t p = lin + j_ * num_threads;
-                if (p < img_size * img_size) {
+                // if (p < img_size * img_size) {
                     uint32_t i = p / img_size;
                     uint32_t j = p % img_size;
                     float cx = (float(j) / float(img_size)) * window_zoom + window_x;
@@ -286,58 +289,51 @@ __global__ void mandelbrot_gpu_vector_multicore_multithread_full_ilp(
                     cx_arr[j_] = cx;
                     cy_arr[j_] = cy;
                     todo ^= (1u << j_);
-                }
+                // }
 	    }
 
-            while (true) {
-                if (!todo) {
-                    #pragma unroll n_ilp_parallel
-                    for (uint32_t j_ = 0; j_ < n_ilp_parallel; ++j_) {
-                        uint32_t p = lin + j_ * num_threads;
-                        if (p < img_size * img_size) {
-                            uint32_t i = p / img_size;
-                            uint32_t j = p % img_size;
-                                    out[i * img_size + j] = iters_arr[j_];
-                                }
-                            }
-                            break;
-                    }
-
+        while (true) {
+            if (!todo) {
                 #pragma unroll n_ilp_parallel
                 for (uint32_t j_ = 0; j_ < n_ilp_parallel; ++j_) {
-                    if (!(todo & (1u << j_))) {
-                        continue;
-                    }
+                    uint32_t p = lin + j_ * num_threads;
+                    // if (p < img_size * img_size) {
+                        uint32_t i = p / img_size;
+                        uint32_t j = p % img_size;
+                        out[i * img_size + j] = iters_arr[j_];
+                    // }
+                }
+                break;
+            }
 
-                    auto cx = cx_arr[j_];
-                    auto cy = cy_arr[j_];
-                    auto x2 = x2_arr[j_];
-                    auto y2 = y2_arr[j_];
-                    auto w = w_arr[j_];
-                    auto iters = iters_arr[j_];
+            #pragma unroll n_ilp_parallel
+            for (uint32_t j_ = 0; j_ < n_ilp_parallel; ++j_) {
+                if (!(todo & (1u << j_))) {
+                    continue;
+                }
 
-                    if (x2 + y2 <= 4.0f && iters < max_iters) {
-                        float x = x2 - y2 + cx;
-                        float y = w - (x2 + y2) + cy;
-                        x2 = x * x;
-                        y2 = y * y;
-                        float z = x + y;
-                        w = z * z;
-                        ++iters;
+                auto x2 = x2_arr[j_];
+                auto y2 = y2_arr[j_];
+                auto iters = iters_arr[j_];
 
-                        cx_arr[j_] = cx;
-                        cy_arr[j_] = cy;
-                        x2_arr[j_] = x2;
-                        y2_arr[j_] = y2;
-                        w_arr[j_] = w;
-                        iters_arr[j_] = iters;
-                    } else {
-			            // set to 0
-			            todo &= ~(1u << j_);
-                    }
+                if (x2 + y2 <= 4.0f && iters < max_iters) {
+                    float x = x2 - y2 + cx_arr[j_];
+                    float y = w_arr[j_] - (x2 + y2) + cy_arr[j_];
+                    x2 = x * x;
+                    y2 = y * y;
+                    float z = x + y;
+                    w_arr[j_] = z * z;
+                    ++iters_arr[j_];
+
+                    x2_arr[j_] = x2;
+                    y2_arr[j_] = y2;
+                } else {
+                    // set to 0
+                    todo &= ~(1u << j_);
                 }
             }
-       }
+        }
+    }
 }
 
 void launch_mandelbrot_gpu_vector_multicore_multithread_full_ilp(
@@ -346,8 +342,8 @@ void launch_mandelbrot_gpu_vector_multicore_multithread_full_ilp(
     uint32_t *out /* pointer to GPU memory */
 ) {
     /* your (CPU) code here... */
-    dim3 block(32, 4, 1);
-    dim3 grid(ceil_div(img_size, block.x * n_ilp_parallel), ceil_div(img_size, block.y * n_ilp_parallel), 1);
+    dim3 grid(num_blocks_ilp, 1, 1);
+    dim3 block(32, 32, 1);
     mandelbrot_gpu_vector_multicore_multithread_full_ilp<<<grid, block>>>(img_size, max_iters, out);
 }
 
