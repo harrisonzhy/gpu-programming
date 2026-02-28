@@ -147,9 +147,9 @@ void launch_mandelbrot_gpu_vector_multicore(
 
 ////////////////////////////////////////////////////////////////////////////////
 // Vector + Multi-core + Multi-thread-per-core (Single SM)
-static constexpr int32_t num_blocks = 24;
+static constexpr int32_t num_blocks_single_sm = 24;
 
-__global__ void __launch_bounds__(64, num_blocks) mandelbrot_gpu_vector_multicore_multithread_single_sm(
+__global__ void __launch_bounds__(64 /* linear block size */, num_blocks_single_sm) mandelbrot_gpu_vector_multicore_multithread_single_sm(
     uint32_t img_size,
     uint32_t max_iters,
     uint32_t *out /* pointer to GPU memory */
@@ -157,7 +157,7 @@ __global__ void __launch_bounds__(64, num_blocks) mandelbrot_gpu_vector_multicor
     /* your (GPU) code here... */
 
     const int32_t linear = (gridDim.x * blockIdx.y + blockIdx.x) * (blockDim.y * blockDim.x) + (blockDim.x * threadIdx.y) + threadIdx.x;
-    const int32_t num_threads = num_blocks * (blockDim.x * blockDim.y);
+    const int32_t num_threads = num_blocks_single_sm * (blockDim.x * blockDim.y);
 
     for (int32_t lin = linear; lin < img_size * img_size; lin += num_threads) {
         int32_t i = lin / img_size;
@@ -193,12 +193,14 @@ void launch_mandelbrot_gpu_vector_multicore_multithread_single_sm(
 ) {
     /* your (CPU) code here... */
     dim3 block(32, 2, 1);
-    dim3 grid(num_blocks, 1, 1);
+    dim3 grid(num_blocks_single_sm, 1, 1);
     mandelbrot_gpu_vector_multicore_multithread_single_sm<<<grid, block>>>(img_size, max_iters, out);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 // Vector + Multi-core + Multi-thread-per-core (Full Machine)
+
+static constexpr int32_t num_blocks_all_sm = 142;
 
 __global__ void mandelbrot_gpu_vector_multicore_multithread_full(
     uint32_t img_size,
@@ -206,7 +208,35 @@ __global__ void mandelbrot_gpu_vector_multicore_multithread_full(
     uint32_t *out /* pointer to GPU memory */
 ) {
     /* your (GPU) code here... */
-    // same as `mandelbrot_gpu_vector_multicore`
+
+    const int32_t linear = (gridDim.x * blockIdx.y + blockIdx.x) * (blockDim.y * blockDim.x) + (blockDim.x * threadIdx.y) + threadIdx.x;
+    const int32_t num_threads = num_blocks_all_sm * (blockDim.x * blockDim.y);
+
+    for (int32_t lin = linear; lin < img_size * img_size; lin += num_threads) {
+        int32_t i = lin / img_size;
+	    int32_t j = lin % img_size;
+
+    	float cx = (float(j) / float(img_size)) * window_zoom + window_x;
+        float cy = (float(i) / float(img_size)) * window_zoom + window_y;
+	    
+        // Innermost loop: start the recursion from z = 0.
+        float x2 = 0.0f;
+        float y2 = 0.0f;
+        float w = 0.0f;
+        uint32_t iters = 0;
+        while (x2 + y2 <= 4.0f && iters < max_iters) {
+            float x = x2 - y2 + cx;
+            float y = w - (x2 + y2) + cy;
+            x2 = x * x;
+            y2 = y * y;
+            float z = x + y;
+            w = z * z;
+            ++iters;
+        }
+
+    	// Write result.
+    	out[i * img_size + j] = iters;
+    }
 }
 
 void launch_mandelbrot_gpu_vector_multicore_multithread_full(
@@ -215,9 +245,9 @@ void launch_mandelbrot_gpu_vector_multicore_multithread_full(
     uint32_t *out /* pointer to GPU memory */
 ) {
     /* your (CPU) code here... */
-    dim3 grid(img_size, img_size, 1);
-    dim3 block(32, 2, 1);
-    mandelbrot_gpu_vector_multicore<<<grid, block>>>(img_size, max_iters, out);
+    dim3 block(32, 32, 1);
+    dim3 grid(num_blocks_all_sm, 1, 1);
+    mandelbrot_gpu_vector_multicore_multithread_full<<<grid, block>>>(img_size, max_iters, out);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
