@@ -186,6 +186,29 @@ void launch_matmul_l1(
 
 namespace matmul_l1_reg {
 
+__device__ void init_hilbert_block(int32_t* __restrict__ bx, int32_t* __restrict__ by) {
+    const int32_t n = 1 << (32 - __clz(max(gridDim.x, gridDim.y) - 1));
+    const int32_t block_id = blockIdx.x * gridDim.y + blockIdx.y;
+
+    *bx = 0;
+    *by = 0;
+    for (int32_t s = 1, d = block_id; s < n; s <<= 1, d >>= 2) {
+        const int32_t rx = 1 & (d >> 1);
+        const int32_t ry = 1 & (d ^ rx);
+        if (ry == 0) {
+            if (rx == 1) {
+                *bx = s - 1 - *bx;
+                *by = s - 1 - *by;
+            }
+            int32_t tmp = *bx; 
+            *bx = *by; 
+            *by = tmp; // reflect
+        }
+        *bx += s * rx;
+        *by += s * ry;
+    }
+}
+
 static constexpr int32_t T = 4;
 
 static constexpr int32_t BIG_TILE_M = 96;
@@ -197,8 +220,6 @@ static constexpr int32_t TILE_K = 64;
 
 static constexpr int32_t N_OVERLAY = 1;
 static constexpr int32_t SMALL_TILE_K = 16;
-
-static constexpr int32_t SWIZZLE = 16;
 
 __global__ void matmul_l1(
     int32_t size_i,
@@ -214,13 +235,11 @@ __global__ void matmul_l1(
     float* shared_b = shared_mem + N_OVERLAY * TILE_M * TILE_K;
 
     const int32_t block_lin = threadIdx.y * blockDim.x + threadIdx.x;
-
-    const int32_t block_id = blockIdx.x * gridDim.y + blockIdx.y;
-    const int32_t group = block_id / (SWIZZLE * gridDim.y);
-    const int32_t within = block_id % (SWIZZLE * gridDim.y);
-    const int32_t bx = group * SWIZZLE + within % SWIZZLE;
-    const int32_t by = within / SWIZZLE;
+    const int32_t grid_size = 1 << (32 - __clz(max(gridDim.x, gridDim.y) - 1));
     
+    int32_t bx, by;
+    init_hilbert_block(&bx, &by);
+
     for (int32_t M0 = bx * BIG_TILE_M; M0 < (bx + 1) * BIG_TILE_M; M0 += TILE_M) {
         for (int32_t N0 = by * BIG_TILE_N; N0 < (by + 1) * BIG_TILE_N; N0 += TILE_N) {
 
