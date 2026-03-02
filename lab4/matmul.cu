@@ -196,8 +196,9 @@ static constexpr int32_t TILE_N = BIG_TILE_N / 1;
 static constexpr int32_t TILE_K = 64;
 
 static constexpr int32_t N_OVERLAY = 1;
-
 static constexpr int32_t SMALL_TILE_K = 16;
+
+static constexpr int32_t SWIZZLE = 16;
 
 __global__ void matmul_l1(
     int32_t size_i,
@@ -213,9 +214,15 @@ __global__ void matmul_l1(
     float* shared_b = shared_mem + N_OVERLAY * TILE_M * TILE_K;
 
     const int32_t block_lin = threadIdx.y * blockDim.x + threadIdx.x;
+
+    const int32_t block_id = blockIdx.x * gridDim.y + blockIdx.y;
+    const int32_t group = block_id / (SWIZZLE * gridDim.y);
+    const int32_t within = block_id % (SWIZZLE * gridDim.y);
+    const int32_t bx = group * SWIZZLE + within % SWIZZLE;
+    const int32_t by = within / SWIZZLE;
     
-    for (int32_t M0 = blockIdx.x * BIG_TILE_M; M0 < (blockIdx.x + 1) * BIG_TILE_M; M0 += TILE_M) {
-        for (int32_t N0 = blockIdx.y * BIG_TILE_N; N0 < (blockIdx.y + 1) * BIG_TILE_N; N0 += TILE_N) {
+    for (int32_t M0 = bx * BIG_TILE_M; M0 < (bx + 1) * BIG_TILE_M; M0 += TILE_M) {
+        for (int32_t N0 = by * BIG_TILE_N; N0 < (by + 1) * BIG_TILE_N; N0 += TILE_N) {
 
             float result[T][T] = {};
 
