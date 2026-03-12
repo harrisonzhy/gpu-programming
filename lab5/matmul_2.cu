@@ -23,6 +23,8 @@ void cuda_check(cudaError_t code, const char *file, int line) {
         cuda_check((x), __FILE__, __LINE__); \
     } while (0)
 
+uint32_t ceil_div(uint32_t a, uint32_t b) { return (a + b - 1) / b; }
+
 __device__ inline void cp_async4(void *smem_ptr, const void *glob_ptr) {
     const int BYTES = 16;
     uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
@@ -75,97 +77,152 @@ template <int N> __device__ __forceinline__ void async_wait_pending() {
 
 namespace matmul_l1_reg {
 
-static constexpr int32_t T = 4; // thread processes TxT output tile
-static constexpr int32_t K = 64;
+__device__ void init_hilbert_block(int32_t* __restrict__ bx, int32_t* __restrict__ by) {
+    const int32_t n = 1 << (32 - __clz(max(gridDim.x, gridDim.y) - 1));
+    const int32_t block_id = blockIdx.x * gridDim.y + blockIdx.y;
 
-__global__ void matmul_l1_reg(
+    *bx = 0;
+    *by = 0;
+    for (int32_t s = 1, d = block_id; s < n; s <<= 1, d >>= 2) {
+        const int32_t rx = 1 & (d >> 1);
+        const int32_t ry = 1 & (d ^ rx);
+        if (ry == 0) {
+            if (rx == 1) {
+                *bx = s - 1 - *bx;
+                *by = s - 1 - *by;
+            }
+            int32_t tmp = *bx; 
+            *bx = *by; 
+            *by = tmp; // reflect
+        }
+        *bx += s * rx;
+        *by += s * ry;
+    }
+}
+
+static constexpr int32_t T = 4;
+
+static constexpr int32_t BIG_TILE_M = 64;
+static constexpr int32_t BIG_TILE_N = 64;
+
+static constexpr int32_t TILE_M = BIG_TILE_M / 1;
+static constexpr int32_t TILE_N = BIG_TILE_N / 1;
+static constexpr int32_t TILE_K = 64;
+
+static constexpr int32_t N_OVERLAY = 1;
+static constexpr int32_t SMALL_TILE_K = 16;
+
+__global__ void matmul_l1(
     int32_t size_i,
     int32_t size_j,
     int32_t size_k,
     float const *a,
     float const *b,
     float *c) {
-    // TODO: your GPU code here
+    /* TODO: your GPU code here */
 
     extern __shared__ float shared_mem[];
     float* shared_a = shared_mem;
-    float* shared_b = shared_mem + K * K;
+    float* shared_b = shared_mem + N_OVERLAY * TILE_M * TILE_K;
 
-    // global indices
-    const int32_t tile_height = blockDim.y * T;
-    const int32_t tile_width = blockDim.x * T;
-    const int32_t block_i0 = tile_height * blockIdx.y;
-    const int32_t block_j0 = tile_width * blockIdx.x;
+    const int32_t block_lin = threadIdx.y * blockDim.x + threadIdx.x;
+    
+    const int32_t bx = blockIdx.x;
+    const int32_t by = blockIdx.y;
 
-    // offset/scratchpad indices
-    const int32_t thread_i0 = threadIdx.y * T;
-    const int32_t thread_j0 = threadIdx.x * T;
+    for (int32_t M0 = bx * BIG_TILE_M; M0 < (bx + 1) * BIG_TILE_M; M0 += TILE_M) {
+        for (int32_t N0 = by * BIG_TILE_N; N0 < (by + 1) * BIG_TILE_N; N0 += TILE_N) {
 
-    float results[T * T] = {0};
+            float result[T][T] = {};
 
-    for (int32_t block_k0 = 0; block_k0 < size_k; block_k0 += K) {
-        // load scratchpad with elements of A and B
-        for (int32_t shared_base = threadIdx.y * blockDim.x + threadIdx.x; 
-                    shared_base < K * K; 
-                    shared_base += blockDim.x * blockDim.y) {
-            const int32_t row = shared_base / K;
-            const int32_t col = shared_base % K;
+            float reg_a[T * SMALL_TILE_K];
+            float reg_b[T * SMALL_TILE_K];
 
-            // indices to load A
-            const int32_t global_i = block_i0 + row;
-            const int32_t global_k = block_k0 + col;
+            // prefetch the first A (TILE_M x TILE_K) and B tiles (TILE_K x TILE_N)
+            {
+                int32_t buf = 0 % N_OVERLAY;
+                float* shared_a_dst = shared_a + buf * (TILE_M * TILE_K);
+                float* shared_b_dst = shared_b + buf * (TILE_K * TILE_N);
+                const float* global_a_src = a + (M0 * size_k + 0 * TILE_K);
+                const float* global_b_src = b + (0 * TILE_K) * size_j + N0;
 
-            // indices to load B
-            const int32_t global_k_ = block_k0 + row;
-            const int32_t global_j = block_j0 + col;
-
-            if (global_i < size_i && global_k < size_k) {
-                shared_a[shared_base] = a[global_i * size_k + global_k];
-            } else {
-                shared_a[shared_base] = 0;
-            }
-            if (global_k_ < size_k && global_j < size_j) {
-                shared_b[shared_base] = b[global_k_ * size_j + global_j];
-            } else {
-                shared_b[shared_base] = 0;
-            }
-        }
-
-        __syncthreads();
-
-        // to exploit register reuse, do outer product
-        for (int32_t kk = 0; kk < K; ++kk) {
-            float reg_a[T];
-            float reg_b[T];
-
-            for (int32_t ii = 0; ii < T; ++ii) {
-                const int32_t row = thread_i0 + ii;
-                reg_a[ii] = shared_a[row * K + kk];
-            }
-            for (int32_t jj = 0; jj < T; ++jj) {
-                const int32_t col = thread_j0 + jj;
-                reg_b[jj] = shared_b[kk * K + col];
-            }
-
-            for (int32_t ii = 0; ii < T; ++ii) {
-                for (int32_t jj = 0; jj < T; ++jj) {
-                    results[ii * T + jj] += reg_a[ii] * reg_b[jj];
+                for (int32_t i = block_lin; i < TILE_M * TILE_K; i += (blockDim.x * blockDim.y)) {
+                    int32_t row = i / TILE_K;
+                    int32_t col = i % TILE_K;
+                    shared_a_dst[i] = global_a_src[row * size_k + col];
+                }
+                for (int32_t i = block_lin; i < TILE_K * TILE_N; i += (blockDim.x * blockDim.y)) {
+                    int32_t row = i / TILE_N;
+                    int32_t col = i % TILE_N;
+                    shared_b_dst[i] = global_b_src[row * size_j + col];
                 }
             }
-        }
 
-        __syncthreads();
-    }
+            for (int32_t k = 1; k < size_k / TILE_K + 1; ++k) {
+                // do computation. every thread is responsible for (T x T) output tiles
+                __syncthreads();
+                {
+                    int32_t buf = (k - 1) % N_OVERLAY; 
+                    float* shared_a_dst = shared_a + buf * (TILE_M * TILE_K);
+                    float* shared_b_dst = shared_b + buf * (TILE_K * TILE_N);
 
-    // writeback results to DRAM
-    for (int32_t ii = 0; ii < T; ++ii) {
-        for (int32_t jj = 0; jj < T; ++jj) {
-            const int32_t i = block_i0 + thread_i0 + ii;
-            const int32_t j = block_j0 + thread_j0 + jj;
-            if (i >= size_i || j >= size_j) {
-                continue;
+                    for (int32_t kk_ = 0; kk_ < TILE_K; kk_ += SMALL_TILE_K) {
+                        for (int32_t kkk = 0; kkk < SMALL_TILE_K; ++kkk) {
+                            int32_t kk = kk_ + kkk;
+
+                            for (int32_t ty = 0; ty < T; ++ty) {
+                                int32_t m = threadIdx.y * T + ty;
+                                reg_a[kkk * T + ty] = shared_a_dst[m * TILE_K + kk];
+                            }
+                            for (int32_t tx = 0; tx < T; ++tx) {
+                                int32_t n = threadIdx.x * T + tx;
+                                reg_b[kkk * T + tx] = shared_b_dst[kk * TILE_N + n];
+                            }
+                        }
+
+                        for (int32_t kkk = 0; kkk < SMALL_TILE_K; ++kkk) {
+                            for (int32_t ty = 0; ty < T; ++ty) {
+                                for (int32_t tx = 0; tx < T; ++tx) {
+                                    result[ty][tx] += reg_a[kkk * T + ty] * reg_b[kkk * T + tx];
+                                }
+                            }
+                        }
+                    }
+                }
+                __syncthreads();
+
+                // load next tile of A and B
+                {
+                    if (k < size_k / TILE_K) {
+                        int32_t buf = k % N_OVERLAY;
+                        float* shared_a_dst = shared_a + buf * (TILE_M * TILE_K);
+                        float* shared_b_dst = shared_b + buf * (TILE_K * TILE_N);
+                        const float* global_a_src = a + (M0 * size_k + k * TILE_K);
+                        const float* global_b_src = b + (k * TILE_K) * size_j + N0;
+
+                        for (int32_t i = block_lin; i < TILE_M * TILE_K; i += (blockDim.x * blockDim.y)) {
+                            int32_t row = i / TILE_K, col = i % TILE_K;
+                            shared_a_dst[i] = global_a_src[row * size_k + col];
+                        }
+                        for (int32_t i = block_lin; i < TILE_K * TILE_N; i += (blockDim.x * blockDim.y)) {
+                            int32_t row = i / TILE_N, col = i % TILE_N;
+                            shared_b_dst[i] = global_b_src[row * size_j + col];
+                        }
+                    }
+                }
             }
-            c[i * size_j + j] = results[ii * T + jj];
+
+            // writeback results to DRAM
+            for (int32_t ty = 0; ty < T; ++ty) {
+                for (int32_t tx = 0; tx < T; ++tx) { 
+                    int32_t m = M0 + threadIdx.y * T + ty;
+                    int32_t n = N0 + threadIdx.x * T + tx;
+                    if (m >= size_i || n >= size_j) {
+                        break;
+                    }
+                    c[m * size_j + n] = result[ty][tx];
+                }
+            }
         }
     }
 }
@@ -177,43 +234,45 @@ void launch_matmul_l1_reg(
     float const *a,
     float const *b,
     float *c) {
-    // TODO: your CPU code here
+    /* TODO: your CPU code here */
 
-    auto ceil_div = [](int32_t a, int32_t b) -> int32_t { return (a + b - 1) / b; };
-
-    dim3 block(ceil_div(K, T), ceil_div(K, T), 1);
-    dim3 grid(ceil_div(size_j, block.x * T), ceil_div(size_i, block.y * T), 1);
+    dim3 block(ceil_div(TILE_M, T), ceil_div(TILE_N, T));
+    dim3 grid(ceil_div(size_i, BIG_TILE_M), ceil_div(size_j, BIG_TILE_N), 1);
     
-    static constexpr int32_t shmem_size = 2 * K * K * sizeof(float);
-    matmul_l1_reg<<<grid, block, shmem_size>>>(size_i, size_j, size_k, a, b, c);
+    static constexpr int32_t shmem_size = N_OVERLAY * (TILE_M * TILE_K + TILE_K * TILE_N) * sizeof(float);
+    // printf("shmem_size: %d", shmem_size);
+
+    CUDA_CHECK(cudaFuncSetAttribute(
+        matmul_l1,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        shmem_size));
+
+    matmul_l1<<<grid, block, shmem_size>>>(size_i, size_j, size_k, a, b, c);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
 }
 
-} // namespace matmul_l1_reg
+}; // namespace matmul_l1_reg
+
 
 ////////////////////////////////////////////////////////////////////////////////
 // Optimized GPU Implementation
 
 namespace matmul_improved {
 
-static constexpr int32_t T = 4; // thread processes TxT output tile
-static constexpr int32_t K = 64;
+// static constexpr int32_t K = 64;
 
-__device__ __forceinline__
-void cp_async_float(float* smem_dst, const float* gmem_src, bool ignore_src) {
-    unsigned smem_addr = __cvta_generic_to_shared(smem_dst);
-    unsigned long long gmem_addr = reinterpret_cast<unsigned long long>(gmem_src);
-    int32_t pred = ignore_src ? 1 : 0;
+static constexpr int32_t T = 4;
 
-    asm volatile(
-        "{ .reg .pred p;\n"
-        "  setp.ne.b32 p, %2, 0;\n"
-        "  cp.async.ca.shared.global [%0], [%1], 4, p;\n"
-        "}\n"
-        :
-        : "r"(smem_addr), "l"(gmem_addr), "r"(pred)
-        : "memory"
-    );
-}
+static constexpr int32_t BIG_TILE_M = 64;
+static constexpr int32_t BIG_TILE_N = 64;
+
+static constexpr int32_t TILE_M = BIG_TILE_M / 1;
+static constexpr int32_t TILE_N = BIG_TILE_N / 1;
+static constexpr int32_t TILE_K = 64;
+
+static constexpr int32_t N_OVERLAY = 1;
+static constexpr int32_t SMALL_TILE_K = 16;
 
 __global__ void matmul_improved(
     int32_t size_i,
@@ -224,87 +283,125 @@ __global__ void matmul_improved(
     float *c /* pointer to GPU memory */) {
     /* TODO: your GPU code here */
 
-    extern __shared__ float shared_mem[];
+    extern __shared__ __align__(16) float shared_mem[];
     float* shared_a = shared_mem;
-    float* shared_b = shared_mem + K * K;
+    float* shared_b = shared_mem + N_OVERLAY * TILE_M * TILE_K;
 
-    // global indices
-    const int32_t tile_height = blockDim.y * T;
-    const int32_t tile_width = blockDim.x * T;
-    const int32_t block_i0 = tile_height * blockIdx.y;
-    const int32_t block_j0 = tile_width * blockIdx.x;
+    const int32_t block_lin = threadIdx.y * blockDim.x + threadIdx.x;
+    
+    const int32_t bx = blockIdx.x;
+    const int32_t by = blockIdx.y;
 
-    // offset/scratchpad indices
-    const int32_t thread_i0 = threadIdx.y * T;
-    const int32_t thread_j0 = threadIdx.x * T;
+    for (int32_t M0 = bx * BIG_TILE_M; M0 < (bx + 1) * BIG_TILE_M; M0 += TILE_M) {
+        for (int32_t N0 = by * BIG_TILE_N; N0 < (by + 1) * BIG_TILE_N; N0 += TILE_N) {
 
-    float results[T * T] = {0};
+            __align__(16) float result[T][T] = {};
 
-    for (int32_t block_k0 = 0; block_k0 < size_k; block_k0 += K) {
-        // load scratchpad with elements of A and B
-        for (int32_t shared_base = threadIdx.y * blockDim.x + threadIdx.x; 
-                    shared_base < K * K; 
-                    shared_base += blockDim.x * blockDim.y) {
-            const int32_t row = shared_base / K;
-            const int32_t col = shared_base % K;
+            __align__(16) float reg_a[T * SMALL_TILE_K];
+            __align__(16) float reg_b[T * SMALL_TILE_K];
 
-            // indices to load A
-            const int32_t global_i = block_i0 + row;
-            const int32_t global_k = block_k0 + col;
+            // prefetch the first A (TILE_M x TILE_K) and B tiles (TILE_K x TILE_N)
+            {
+                int32_t buf = 0 % N_OVERLAY;
+                float* shared_a_dst = shared_a + buf * (TILE_M * TILE_K);
+                float* shared_b_dst = shared_b + buf * (TILE_K * TILE_N);
+                const float* global_a_src = a + (M0 * size_k + 0 * TILE_K);
+                const float* global_b_src = b + (0 * TILE_K) * size_j + N0;
 
-            // indices to load B
-            const int32_t global_k_ = block_k0 + row;
-            const int32_t global_j = block_j0 + col;
+                for (int32_t i = block_lin * 4; i < TILE_M * TILE_K; i += (blockDim.x * blockDim.y) * 4) {
+                    int32_t row = i / TILE_K;
+                    int32_t col = i % TILE_K;
+                    // shared_a_dst[i] = global_a_src[row * size_k + col];
 
-            // async copy
-            bool a_oob = !(global_i < size_i && global_k < size_k);
-            bool b_oob = !(global_k_ < size_k && global_j < size_j);
+                    cp_async4(&shared_a_dst[i], &global_a_src[row * size_k + col]);
+                }
+                for (int32_t i = block_lin * 4; i < TILE_K * TILE_N; i += (blockDim.x * blockDim.y) * 4) {
+                    int32_t row = i / TILE_N;
+                    int32_t col = i % TILE_N;
+                    // shared_b_dst[i] = global_b_src[row * size_j + col];
 
-            const float* a_src = (a_oob) ? a : &a[global_i * size_k + global_k];
-            const float* b_src = (b_oob) ? b : &b[global_k_ * size_j + global_j];
-
-            cp_async_float(&shared_a[shared_base], a_src, a_oob);
-            cp_async_float(&shared_b[shared_base], b_src, b_oob);
-        }
-
-        async_commit_group();
-        async_wait_pending<0>();
-
-        __syncthreads();
-
-        // to exploit register reuse, do outer product
-        for (int32_t kk = 0; kk < K; ++kk) {
-            float reg_a[T];
-            float reg_b[T];
-
-            for (int32_t ii = 0; ii < T; ++ii) {
-                const int32_t row = thread_i0 + ii;
-                reg_a[ii] = shared_a[row * K + kk];
-            }
-            for (int32_t jj = 0; jj < T; ++jj) {
-                const int32_t col = thread_j0 + jj;
-                reg_b[jj] = shared_b[kk * K + col];
+                    cp_async4(&shared_b_dst[i], &global_b_src[row * size_j + col]);
+                }
+                async_commit_group();
             }
 
-            for (int32_t ii = 0; ii < T; ++ii) {
-                for (int32_t jj = 0; jj < T; ++jj) {
-                    results[ii * T + jj] += reg_a[ii] * reg_b[jj];
+            for (int32_t k = 1; k < size_k / TILE_K + 1; ++k) {
+                // do computation. every thread is responsible for (T x T) output tiles
+                async_wait_pending<0>();
+                __syncthreads();
+                {
+                    int32_t buf = (k - 1) % N_OVERLAY;
+                    float* shared_a_dst = shared_a + buf * (TILE_M * TILE_K);
+                    float* shared_b_dst = shared_b + buf * (TILE_K * TILE_N);
+
+                    for (int32_t kk_ = 0; kk_ < TILE_K; kk_ += SMALL_TILE_K) {
+                        for (int32_t kkk = 0; kkk < SMALL_TILE_K; ++kkk) {
+                            int32_t kk = kk_ + kkk;
+
+                            for (int32_t ty = 0; ty < T; ++ty) {
+                                int32_t m = threadIdx.y * T + ty;
+                                reg_a[kkk * T + ty] = shared_a_dst[m * TILE_K + kk];
+                            }
+                            for (int32_t tx = 0; tx < T; ++tx) {
+                                int32_t n = threadIdx.x * T + tx;
+                                reg_b[kkk * T + tx] = shared_b_dst[kk * TILE_N + n];
+                            }
+                        }
+
+                        for (int32_t kkk = 0; kkk < SMALL_TILE_K; ++kkk) {
+                            for (int32_t ty = 0; ty < T; ++ty) {
+                                for (int32_t tx = 0; tx < T; ++tx) {
+                                    result[ty][tx] += reg_a[kkk * T + ty] * reg_b[kkk * T + tx];
+                                }
+                            }
+                        }
+                    }
+                }
+                __syncthreads();
+
+                // load next tile of A and B
+                {
+                    if (k < size_k / TILE_K) {
+                        int32_t buf = k % N_OVERLAY;
+                        float* shared_a_dst = shared_a + buf * (TILE_M * TILE_K);
+                        float* shared_b_dst = shared_b + buf * (TILE_K * TILE_N);
+                        const float* global_a_src = a + (M0 * size_k + k * TILE_K);
+                        const float* global_b_src = b + (k * TILE_K) * size_j + N0;
+
+                        for (int32_t i = block_lin * 4; i < TILE_M * TILE_K; i += (blockDim.x * blockDim.y) * 4) {
+                            int32_t row = i / TILE_K, col = i % TILE_K;
+                            // shared_a_dst[i] = global_a_src[row * size_k + col];
+                            cp_async4(&shared_a_dst[i], &global_a_src[row * size_k + col]);
+                        }
+                        for (int32_t i = block_lin * 4; i < TILE_K * TILE_N; i += (blockDim.x * blockDim.y) * 4) {
+                            int32_t row = i / TILE_N, col = i % TILE_N;
+                            // shared_b_dst[i] = global_b_src[row * size_j + col];
+                            cp_async4(&shared_b_dst[i], &global_b_src[row * size_j + col]);
+                        }
+                        async_commit_group();
+                    }
                 }
             }
-        }
 
-        __syncthreads();
-    }
-
-    // writeback results to DRAM
-    for (int32_t ii = 0; ii < T; ++ii) {
-        for (int32_t jj = 0; jj < T; ++jj) {
-            const int32_t i = block_i0 + thread_i0 + ii;
-            const int32_t j = block_j0 + thread_j0 + jj;
-            if (i >= size_i || j >= size_j) {
-                continue;
+            // writeback results to DRAM
+            for (int32_t ty = 0; ty < T; ++ty) {
+                for (int32_t tx = 0; tx < T; tx += 4) {
+                    int32_t m = M0 + threadIdx.y * T + ty;
+                    int32_t n = N0 + threadIdx.x * T + tx;
+                    if (m >= size_i) {
+                        break;
+                    }
+                    if (tx + 3 < T && n + 3 < size_j) {
+                        *reinterpret_cast<float4*>(&c[m * size_j + n]) = *reinterpret_cast<float4*>(&result[ty][tx]);
+                    } else {
+                        for (; tx < T; ++tx) {
+                            int32_t n = N0 + threadIdx.x * T + tx;
+                            c[m * size_j + n] = result[ty][tx]; 
+                        }
+                        break;
+                    }
+                }
             }
-            c[i * size_j + j] = results[ii * T + jj];
         }
     }
 }
@@ -313,18 +410,25 @@ void launch_matmul_improved(
     int32_t size_i,
     int32_t size_j,
     int32_t size_k,
-    float const *a, /* pointer to GPU memory */
-    float const *b, /* pointer to GPU memory */
-    float *c /* pointer to GPU memory */) {
+    float const *a,
+    float const *b,
+    float *c) {
     /* TODO: your CPU code here */
 
-    auto ceil_div = [](int32_t a, int32_t b) -> int32_t { return (a + b - 1) / b; };
-
-    dim3 block(ceil_div(K, T), ceil_div(K, T), 1);
-    dim3 grid(ceil_div(size_j, block.x * T), ceil_div(size_i, block.y * T), 1);
+    dim3 block(ceil_div(TILE_M, T), ceil_div(TILE_N, T));
+    dim3 grid(ceil_div(size_i, BIG_TILE_M), ceil_div(size_j, BIG_TILE_N), 1);
     
-    static constexpr int32_t shmem_size = 2 * K * K * sizeof(float);
+    static constexpr int32_t shmem_size = N_OVERLAY * (TILE_M * TILE_K + TILE_K * TILE_N) * sizeof(float);
+    // printf("shmem_size: %d", shmem_size);
+
+    CUDA_CHECK(cudaFuncSetAttribute(
+        matmul_improved,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        shmem_size));
+
     matmul_improved<<<grid, block, shmem_size>>>(size_i, size_j, size_k, a, b, c);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
 }
 
 }; // namespace matmul_improved
