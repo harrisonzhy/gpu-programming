@@ -298,6 +298,7 @@ namespace matmul_tensor {
 // these should not be changed from (16x8) and ((8x8)x2) respectively
 static constexpr int32_t PROB_A_ELEMS = 16 * 8;
 static constexpr int32_t PROB_B_ELEMS = (8 * 8) * 2;
+static constexpr int32_t PROB_B_REPEAT = 4;
 
 static constexpr int32_t N_OVERLAY = 2; // how many (16x8)x((8x8)x2) tiles to process at once
 static constexpr int32_t WARPS_M = 4;
@@ -344,7 +345,7 @@ __global__ void matmul_improved_reduce(
 
     // output C coords
     const int32_t block_m0 = blockIdx.x * (16 * WARPS_M);
-    const int32_t block_n0 = blockIdx.y * (16 * WARPS_N);
+    const int32_t block_n0 = blockIdx.y * (16 * WARPS_N * PROB_B_REPEAT);
    
     extern __shared__ __align__(16) float shared_mem[];
 
@@ -375,17 +376,19 @@ __global__ void matmul_improved_reduce(
             cp_async4(&shared_a[row * 8 + col], &a[global_i * size_k + global_k]);
         }
         if (warp_i == 0) {
-            // B ((8x8)x2)
-            const int32_t row = lane / 4;
-            const int32_t col = (lane % 4) * 4; // 0, 4, 8, 12
-            const int32_t global_k = block_k0 + row;
-            const int32_t global_j = block_n0 + warp_j * 16 + col;
-            cp_async4(&shared_b[row * 16 + col], &b[global_k * size_j + global_j]);
+            // B ((8x8)x2) x PROB_B_REPEAT
+            for (int32_t repeat = 0; repeat < PROB_B_REPEAT; ++repeat) {
+                const int32_t row = lane / 4;
+                const int32_t col = (lane % 4) * 4; // 0, 4, 8, 12
+                const int32_t global_k = block_k0 + row;
+                const int32_t global_j = block_n0 + warp_j * 16 * PROB_B_REPEAT + col + (repeat * 16);
+                cp_async4(&shared_b[repeat * PROB_B_ELEMS + row * 16 + col], &b[global_k * size_j + global_j]);
+            }
         }
     };
 
-    float c_reg[8] = {0};
-    auto perform_compute = [&](float* __restrict__ shared_a, float* __restrict__ shared_b) {
+    float c_regs[8 * PROB_B_REPEAT] = {0};
+    auto perform_compute = [&](float* __restrict__ c_reg, float* __restrict__ shared_a, float* __restrict__ shared_b) {
         uint32_t a_reg[4] = {
             __float_as_uint(shared_a[a_idx[0]]),
             __float_as_uint(shared_a[a_idx[1]]),
@@ -437,7 +440,7 @@ __global__ void matmul_improved_reduce(
         if (warp_i == 0 || warp_j == 0) {
             perform_cp_async(k_init,
                             &shared_a[buf * (WARPS_M * PROB_A_ELEMS) + warp_i * PROB_A_ELEMS],
-                            &shared_b[buf * (WARPS_N * PROB_B_ELEMS) + warp_j * PROB_B_ELEMS]);
+                            &shared_b[buf * (WARPS_N * PROB_B_ELEMS * PROB_B_REPEAT) + warp_j * PROB_B_ELEMS * PROB_B_REPEAT]);
             async_commit_group();
         }
     }
@@ -447,8 +450,11 @@ __global__ void matmul_improved_reduce(
         {
             // compute previous tile
             int32_t buf = (k - (N_OVERLAY - 1) * TILE_K) % N_OVERLAY;
-            perform_compute(&shared_a[buf * (WARPS_M * PROB_A_ELEMS) + warp_i * PROB_A_ELEMS], 
-                            &shared_b[buf * (WARPS_N * PROB_B_ELEMS) + warp_j * PROB_B_ELEMS]);
+            for (int32_t repeat = 0; repeat < PROB_B_REPEAT; ++repeat) {
+                perform_compute(&c_regs[repeat * 8],
+                                &shared_a[buf * (WARPS_M * PROB_A_ELEMS) + warp_i * PROB_A_ELEMS], 
+                                &shared_b[buf * (WARPS_N * PROB_B_ELEMS * PROB_B_REPEAT) + warp_j * PROB_B_ELEMS * PROB_B_REPEAT + repeat * PROB_B_ELEMS]);
+            }
         }
         __syncthreads();
         if (k < CHUNK_K * (blockIdx.z + 1)) {
@@ -457,29 +463,31 @@ __global__ void matmul_improved_reduce(
             if (warp_i == 0 || warp_j == 0) {
                 perform_cp_async(k, 
                                 &shared_a[buf * (WARPS_M * PROB_A_ELEMS) + warp_i * PROB_A_ELEMS], 
-                                &shared_b[buf * (WARPS_N * PROB_B_ELEMS) + warp_j * PROB_B_ELEMS]);
+                                &shared_b[buf * (WARPS_N * PROB_B_ELEMS * PROB_B_REPEAT) + warp_j * PROB_B_ELEMS * PROB_B_REPEAT]);
                 async_commit_group();
             }
         }
     }
     
     float* out = partial_sums + blockIdx.z * (size_i * size_j);
-    for (int32_t t = 0; t < 4; ++t) {
-        const int32_t idx = cd_idx[t];
-        const int32_t row = idx / 8;
-        const int32_t col = idx % 8;
+    for (int32_t repeat = 0; repeat < PROB_B_REPEAT; ++repeat) {
+        for (int32_t t = 0; t < 4; ++t) {
+            const int32_t idx = cd_idx[t];
+            const int32_t row = idx / 8;
+            const int32_t col = idx % 8;
 
-        const int32_t global_i = block_m0 + warp_i * 16 + row;
-        const int32_t global_j0 = block_n0 + warp_j * 16 + col;
-        const int32_t global_j1 = block_n0 + warp_j * 16 + col + 8;
+            const int32_t global_i = block_m0 + warp_i * 16 + row;
+            const int32_t global_j0 = block_n0 + warp_j * 16 * PROB_B_REPEAT + repeat * 16 + col;
+            const int32_t global_j1 = block_n0 + warp_j * 16 * PROB_B_REPEAT + repeat * 16 + (col + 8);
 
-        const bool oob0 = !(global_i < size_i && global_j0 < size_j);
-        const bool oob1 = !(global_i < size_i && global_j1 < size_j);
-        if (!oob0) {
-            out[global_i * size_j + global_j0] = c_reg[t];
-        }
-        if (!oob1) {
-            out[global_i * size_j + global_j1] = c_reg[4 + t];
+            const bool oob0 = !(global_i < size_i && global_j0 < size_j);
+            const bool oob1 = !(global_i < size_i && global_j1 < size_j);
+            if (!oob0) {
+                out[global_i * size_j + global_j0] = c_regs[repeat * 8 + t];
+            }
+            if (!oob1) {
+                out[global_i * size_j + global_j1] = c_regs[repeat * 8 + 4 + t];
+            }
         }
     }
 }
@@ -508,8 +516,8 @@ void launch_matmul_tensor(
 
     {
         dim3 block(32, num_warps, 1);
-        dim3 grid(ceil_div(size_i, 16 * WARPS_M), ceil_div(size_j, 16 * WARPS_N), num_k_chunks);
-        const int32_t shmem_size = N_OVERLAY * (WARPS_M * PROB_A_ELEMS + WARPS_N * PROB_B_ELEMS) * sizeof(float);
+        dim3 grid(ceil_div(size_i, 16 * WARPS_M), ceil_div(size_j, 16 * WARPS_N * PROB_B_REPEAT), num_k_chunks);
+        const int32_t shmem_size = N_OVERLAY * (WARPS_M * PROB_A_ELEMS + WARPS_N * PROB_B_ELEMS * PROB_B_REPEAT) * sizeof(float);
         cudaFuncSetAttribute(
             matmul_improved_reduce,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
