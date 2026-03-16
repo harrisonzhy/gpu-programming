@@ -305,26 +305,8 @@ static constexpr int32_t WARPS_M = 4;
 static constexpr int32_t WARPS_N = 4;
 
 static constexpr int32_t TILE_K = 8; // should not be changed from 8
-static constexpr int32_t CHUNK_K = TILE_K * 128;
 
-template<int32_t MaxN>
-__device__ __forceinline__ void async_wait_pending_dynamic(int32_t n) {
-    if (n <= 0) {
-        async_wait_pending<0>();
-        return;
-    }
-    if (n >= MaxN) {
-        async_wait_pending<MaxN>();
-        return;
-    }
-    if constexpr (MaxN > 0) {
-        if (n == MaxN) {
-            async_wait_pending<MaxN>();
-        } else {
-            async_wait_pending_dynamic<MaxN - 1>(n);
-        }
-    }
-}
+static constexpr int32_t CHUNK_K = TILE_K * 128;
 
 /* TODO: your GPU kernels here... */
 
@@ -435,8 +417,10 @@ __global__ void matmul_improved_reduce(
         );
     };
 
-    for (int32_t k_init = CHUNK_K * blockIdx.z; k_init < CHUNK_K * blockIdx.z + (N_OVERLAY - 1) * TILE_K; k_init += TILE_K) {
-        int32_t buf = k_init % N_OVERLAY;
+    // prefill
+    for (int32_t idx = 0; idx < N_OVERLAY - 1; ++idx) {
+        int32_t k_init = CHUNK_K * blockIdx.z + idx * TILE_K;
+        int32_t buf = idx /* % N_OVERLAY */;
         if (warp_i == 0 || warp_j == 0) {
             perform_cp_async(k_init,
                             &shared_a[buf * (WARPS_M * PROB_A_ELEMS) + warp_i * PROB_A_ELEMS],
@@ -444,22 +428,25 @@ __global__ void matmul_improved_reduce(
             async_commit_group();
         }
     }
-    for (int32_t k = CHUNK_K * blockIdx.z + (N_OVERLAY - 1) * TILE_K; k < CHUNK_K * (blockIdx.z + 1) + (N_OVERLAY - 1) * TILE_K; k += TILE_K) {
+
+    int32_t tile = N_OVERLAY - 1;
+    for (int32_t k = CHUNK_K * blockIdx.z + (N_OVERLAY - 1) * TILE_K; 
+                 k < CHUNK_K * (blockIdx.z + 1) + (N_OVERLAY - 1) * TILE_K; 
+                 k += TILE_K, tile += 1) {
         async_wait_pending<0>();
         __syncthreads();
         {
             // compute previous tile
-            int32_t buf = (k - (N_OVERLAY - 1) * TILE_K) % N_OVERLAY;
+            int32_t buf = (tile - (N_OVERLAY - 1)) % N_OVERLAY;
             for (int32_t repeat = 0; repeat < PROB_B_REPEAT; ++repeat) {
                 perform_compute(&c_regs[repeat * 8],
                                 &shared_a[buf * (WARPS_M * PROB_A_ELEMS) + warp_i * PROB_A_ELEMS], 
                                 &shared_b[buf * (WARPS_N * PROB_B_ELEMS * PROB_B_REPEAT) + warp_j * PROB_B_ELEMS * PROB_B_REPEAT + repeat * PROB_B_ELEMS]);
             }
         }
-        __syncthreads();
         if (k < CHUNK_K * (blockIdx.z + 1)) {
             // fetch tile
-            int32_t buf = k % N_OVERLAY;
+            int32_t buf = tile % N_OVERLAY;
             if (warp_i == 0 || warp_j == 0) {
                 perform_cp_async(k, 
                                 &shared_a[buf * (WARPS_M * PROB_A_ELEMS) + warp_i * PROB_A_ELEMS], 
