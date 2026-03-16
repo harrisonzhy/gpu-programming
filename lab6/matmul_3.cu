@@ -90,7 +90,7 @@ static constexpr int32_t TILE_M = BIG_TILE_M / 1;
 static constexpr int32_t TILE_N = BIG_TILE_N / 1;
 static constexpr int32_t TILE_K = 64;
 
-static constexpr int32_t N_OVERLAY = 2;
+static constexpr int32_t N_OVERLAY = 2; // should not be changed from 2
 static constexpr int32_t SMALL_TILE_K = 8;
 static constexpr int32_t CHUNK_K = TILE_K * 4;
 
@@ -140,12 +140,13 @@ __global__ void matmul_improved_reduce(
                 async_commit_group();
             }
 
-            for (int32_t k = CHUNK_K * blockIdx.z + TILE_K; k < CHUNK_K * (blockIdx.z + 1) + TILE_K; k += TILE_K) {
+            int32_t tile = 1;
+            for (int32_t k = CHUNK_K * blockIdx.z + TILE_K; k < CHUNK_K * (blockIdx.z + 1) + TILE_K; k += TILE_K, tile += 1) {
                 async_wait_pending<0>();
                 __syncthreads();
                 {
                     // compute on the previous tile
-                    int32_t buf = (k - TILE_K) % N_OVERLAY;
+                    int32_t buf = (tile - 1) % N_OVERLAY;
                     float* shared_a_dst = shared_a + buf * (TILE_M * TILE_K);
                     float* shared_b_dst = shared_b + buf * (TILE_K * TILE_N);
 
@@ -173,7 +174,7 @@ __global__ void matmul_improved_reduce(
                 {
                     if (k < CHUNK_K * (blockIdx.z + 1)) {
                         // fetch new tile
-                        int32_t buf = k % N_OVERLAY;
+                        int32_t buf = tile % N_OVERLAY;
                         float* shared_a_dst = shared_a + buf * (TILE_M * TILE_K);
                         float* shared_b_dst = shared_b + buf * (TILE_K * TILE_N);
                         const float* global_a_src = a + (M0 * size_k + k);
